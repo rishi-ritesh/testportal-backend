@@ -1,5 +1,7 @@
 const Subject = require("../models/Subject");
 const Topic = require("../models/Topic");
+const Question = require("../models/Question");
+const SetPaper = require("../models/SetPaper");
 
 /* ---------------- SUBJECTS ---------------- */
 
@@ -82,6 +84,496 @@ exports.deleteTopic = async (req, res) => {
     await Topic.findByIdAndUpdate(id, { isActive: false });
 
     res.json({ message: "Topic deleted successfully" });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/* ---------------- QUESTIONS ---------------- */
+
+exports.createQuestion = async (req, res) => {
+  try {
+    const {
+      subjectId,
+      topicId,
+      question,
+      options,
+      correctAnswer,
+      explanation
+    } = req.body;
+
+    // Basic validations
+    if (!subjectId || !topicId)
+      return res.status(400).json({ message: "Subject and Topic required" });
+
+    if (!question?.en || !question?.hi)
+      return res.status(400).json({ message: "Bilingual question required" });
+
+    if (!options || options.length < 2)
+      return res.status(400).json({ message: "Minimum 2 options required" });
+
+    const validKeys = options.map(opt => opt.key);
+
+    if (!validKeys.includes(correctAnswer))
+      return res.status(400).json({ message: "Correct answer must match option key" });
+
+    const newQuestion = await Question.create({
+      subjectId,
+      topicId,
+      question,
+      options,
+      correctAnswer,
+      explanation
+    });
+
+    res.json(newQuestion);
+
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(400).json({ message: "Question already exists (English duplicate)" });
+    }
+
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.getQuestionsByTopic = async (req, res) => {
+  try {
+    const { topicId } = req.params;
+
+    const questions = await Question.find({
+      topicId,
+      isActive: true
+    });
+
+    res.json(questions);
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.deleteQuestion = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await Question.findByIdAndUpdate(id, { isActive: false });
+
+    res.json({ message: "Question deleted successfully" });
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.searchQuestions = async (req, res) => {
+  try {
+    const { subjectId, topicId, q, status } = req.query;
+
+    let filter = {};
+
+    // Subject filter
+    if (subjectId) {
+      filter.subjectId = subjectId;
+    }
+
+    // Topic filter
+    if (topicId) {
+      filter.topicId = topicId;
+    }
+
+    // Text search (English question)
+    if (q) {
+      filter["question.en"] = {
+        $regex: q,
+        $options: "i"
+      };
+    }
+
+    // Status filter
+    if (status === "active") {
+      filter.isActive = true;
+    } else if (status === "inactive") {
+      filter.isActive = false;
+    }
+    // if status === "both" or undefined → do nothing
+
+    const questions = await Question.find(filter)
+      .limit(50)
+      .sort({ createdAt: -1 });
+
+    res.json(questions);
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+
+/* ---------------- SET PAPERS ---------------- */
+
+exports.createSet = async (req, res) => {
+  try {
+    const { title } = req.body;
+
+    if (!title)
+      return res.status(400).json({ message: "Title is required" });
+
+    const set = await SetPaper.create({
+      title,
+      sections: []
+    });
+
+    res.json(set);
+
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(400).json({ message: "Set title must be unique" });
+    }
+
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.getSets = async (req, res) => {
+  const sets = await SetPaper.find({ isActive: true });
+  res.json(sets);
+};
+
+exports.deleteSet = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await SetPaper.findByIdAndUpdate(id, { isActive: false });
+
+    res.json({ message: "Set deleted successfully" });
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// exports.togglePublishSet = async (req, res) => {
+//   try {
+//     const { id } = req.params;
+
+//     const set = await SetPaper.findById(id);
+
+//     // ❗ Prevent publish if subjects are incomplete
+//     for (const section of set.sections) {
+//       for (const subject of section.subjects) {
+
+//         const totalQuestions = subject.questions.length;
+//         const maxQuestions = subject.maxQuestions || 0;
+
+//         if (maxQuestions > 0 && totalQuestions !== maxQuestions) {
+//           return res.status(400).json({
+//             message: `Subject has ${totalQuestions}/${maxQuestions} questions. Complete it before publishing.`
+//           });
+//         }
+//       }
+//     }
+
+//     if (!set) {
+//       return res.status(404).json({ message: "Set not found" });
+//     }
+
+//     // Optional validation:
+//     if (set.sections.length === 0) {
+//       return res.status(400).json({
+//         message: "Cannot publish a set without sections"
+//       });
+//     }
+
+//     for (const section of set.sections) {
+//       for (const subject of section.subjects) {
+
+//         if (subject.questions.length !== subject.maxQuestions) {
+//           return res.status(400).json({
+//             message: `Subject in section "${section.name}" must have exactly ${subject.maxQuestions} questions`
+//           });
+//         }
+
+//       }
+//     }
+
+//     set.isPublished = !set.isPublished;
+
+//     await set.save();
+
+//     res.json({
+//       message: `Set ${set.isPublished ? "published" : "unpublished"} successfully`,
+//       isPublished: set.isPublished
+//     });
+
+//   } catch (err) {
+//     res.status(500).json({ message: err.message });
+//   }
+// };
+
+exports.togglePublishSet = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const set = await SetPaper.findById(id);
+
+    if (!set) {
+      return res.status(404).json({ message: "Set not found" });
+    }
+
+    // Only validate when publishing (not unpublishing)
+    if (!set.isPublished) {
+
+      if (set.sections.length === 0) {
+        return res.status(400).json({
+          message: "Cannot publish a set without sections"
+        });
+      }
+
+      // ❗ Validate subjects
+      for (const section of set.sections) {
+        for (const subject of section.subjects) {
+
+          const totalQuestions = subject.questions.length;
+          const maxQuestions = subject.maxQuestions || 0;
+
+          if (maxQuestions > 0 && totalQuestions !== maxQuestions) {
+            return res.status(400).json({
+              message: `Section "${section.name}" → Subject incomplete (${totalQuestions}/${maxQuestions})`
+            });
+          }
+        }
+      }
+    }
+
+    set.isPublished = !set.isPublished;
+
+    await set.save();
+
+    res.json({
+      message: `Set ${set.isPublished ? "published" : "unpublished"} successfully`,
+      isPublished: set.isPublished
+    });
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.getSetById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const set = await SetPaper.findById(id)
+      .populate("sections.subjects.subjectId")
+      .populate("sections.subjects.questions.questionId");
+
+    if (!set) {
+      return res.status(404).json({ message: "Set not found" });
+    }
+
+    res.json(set);
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+
+exports.addSectionToSet = async (req, res) => {
+  try {
+    const { setId } = req.params;
+    const { name, duration, positiveMarks, negativeMarks } = req.body;
+
+    if (!name || !duration || positiveMarks === undefined || negativeMarks === undefined) {
+      return res.status(400).json({ message: "All section fields required" });
+    }
+
+    const set = await SetPaper.findById(setId);
+    if (!set) {
+      return res.status(404).json({ message: "Set not found" });
+    }
+
+    // Check duplicate section name inside this set
+    const sectionExists = set.sections.some(
+      (section) => section.name.toLowerCase() === name.toLowerCase()
+    );
+
+    if (sectionExists) {
+      return res.status(400).json({ message: "Section name already exists in this set" });
+    }
+
+    set.sections.push({
+      name,
+      duration,
+      positiveMarks,
+      negativeMarks,
+      subjects: []
+    });
+
+    await set.save();
+
+    res.json(set);
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.addSubjectToSection = async (req, res) => {
+  try {
+    const { setId, sectionName } = req.params;
+    const { subjectId, maxQuestions } = req.body;
+
+    if (!subjectId) {
+      return res.status(400).json({ message: "Subject ID required" });
+    }
+
+    const set = await SetPaper.findById(setId);
+    if (!set) {
+      return res.status(404).json({ message: "Set not found" });
+    }
+
+    // Find section
+    const section = set.sections.find(
+      (sec) => sec.name.toLowerCase() === sectionName.toLowerCase()
+    );
+
+    if (!section) {
+      return res.status(404).json({ message: "Section not found" });
+    }
+
+    // Check if subject already exists in ANY section
+    const subjectExistsAnywhere = set.sections.some((sec) =>
+      sec.subjects.some(
+        (sub) => sub.subjectId.toString() === subjectId
+      )
+    );
+
+    if (subjectExistsAnywhere) {
+      return res.status(400).json({
+        message: "Subject already assigned in another section of this set"
+      });
+    }
+
+    section.subjects.push({
+      subjectId,
+      maxQuestions: maxQuestions || 0,
+      questions: []
+    });
+
+
+    await set.save();
+
+    res.json(set);
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.addQuestionToSectionSubject = async (req, res) => {
+  try {
+    const { setId, sectionName, subjectId } = req.params;
+    const { questionId } = req.body;
+
+    if (!questionId) {
+      return res.status(400).json({ message: "Question ID required" });
+    }
+
+    const set = await SetPaper.findById(setId);
+    if (!set) {
+      return res.status(404).json({ message: "Set not found" });
+    }
+
+    const section = set.sections.find(
+      (sec) => sec.name.toLowerCase() === sectionName.toLowerCase()
+    );
+
+    if (!section) {
+      return res.status(404).json({ message: "Section not found" });
+    }
+
+    const subject = section.subjects.find(
+      (sub) => sub.subjectId.toString() === subjectId
+    );
+
+    if (!subject) {
+      return res.status(404).json({ message: "Subject not found in this section" });
+    }
+
+    const question = await Question.findOne({
+      _id: questionId,
+      subjectId,
+      isActive: true
+    });
+
+    if (!question) {
+      return res.status(400).json({
+        message: "Question invalid or does not belong to this subject"
+      });
+    }
+
+    const alreadyExists = subject.questions.some(
+      (q) => q.questionId.toString() === questionId
+    );
+
+    if (alreadyExists) {
+      return res.status(400).json({
+        message: "Question already added to this subject"
+      });
+    }
+
+    if (subject.questions.length >= subject.maxQuestions) {
+      return res.status(400).json({
+        message: `Maximum ${subject.maxQuestions} questions allowed for this subject`
+      });
+    }
+
+    subject.questions.push({ questionId });
+
+    await set.save();
+
+    res.json(set);
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.removeQuestionFromSectionSubject = async (req, res) => {
+  try {
+    const { setId, sectionName, subjectId, questionId } = req.params;
+
+    const set = await SetPaper.findById(setId);
+    if (!set) {
+      return res.status(404).json({ message: "Set not found" });
+    }
+
+    const section = set.sections.find(
+      (sec) => sec.name.toLowerCase() === sectionName.toLowerCase()
+    );
+
+    if (!section) {
+      return res.status(404).json({ message: "Section not found" });
+    }
+
+    const subject = section.subjects.find(
+      (sub) => sub.subjectId.toString() === subjectId
+    );
+
+    if (!subject) {
+      return res.status(404).json({ message: "Subject not found in this section" });
+    }
+
+    subject.questions = subject.questions.filter(
+      (q) => q.questionId.toString() !== questionId
+    );
+
+    await set.save();
+
+    res.json({ message: "Question removed successfully" });
+
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
