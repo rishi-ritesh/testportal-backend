@@ -3,6 +3,16 @@ const Topic = require("../models/Topic");
 const Question = require("../models/Question");
 const SetPaper = require("../models/SetPaper");
 
+const blockIfPublished = (set, res) => {
+  if (set.isPublished) {
+    res.status(400).json({
+      message: "Cannot modify a published set"
+    });
+    return true;
+  }
+  return false;
+};
+
 /* ---------------- SUBJECTS ---------------- */
 
 exports.createSubject = async (req, res) => {
@@ -311,6 +321,55 @@ exports.deleteSet = async (req, res) => {
 //   }
 // };
 
+// exports.togglePublishSet = async (req, res) => {
+//   try {
+//     const { id } = req.params;
+
+//     const set = await SetPaper.findById(id);
+
+//     if (!set) {
+//       return res.status(404).json({ message: "Set not found" });
+//     }
+
+//     // Only validate when publishing (not unpublishing)
+//     if (!set.isPublished) {
+
+//       if (set.sections.length === 0) {
+//         return res.status(400).json({
+//           message: "Cannot publish a set without sections"
+//         });
+//       }
+
+//       // ❗ Validate subjects
+//       for (const section of set.sections) {
+//         for (const subject of section.subjects) {
+
+//           const totalQuestions = subject.questions.length;
+//           const maxQuestions = subject.maxQuestions || 0;
+
+//           if (maxQuestions > 0 && totalQuestions !== maxQuestions) {
+//             return res.status(400).json({
+//               message: `Section "${section.name}" → Subject incomplete (${totalQuestions}/${maxQuestions})`
+//             });
+//           }
+//         }
+//       }
+//     }
+
+//     set.isPublished = !set.isPublished;
+
+//     await set.save();
+
+//     res.json({
+//       message: `Set ${set.isPublished ? "published" : "unpublished"} successfully`,
+//       isPublished: set.isPublished
+//     });
+
+//   } catch (err) {
+//     res.status(500).json({ message: err.message });
+//   }
+// };
+
 exports.togglePublishSet = async (req, res) => {
   try {
     const { id } = req.params;
@@ -324,20 +383,38 @@ exports.togglePublishSet = async (req, res) => {
     // Only validate when publishing (not unpublishing)
     if (!set.isPublished) {
 
-      if (set.sections.length === 0) {
+      // ❗ Check if sections exist
+      if (!set.sections || set.sections.length === 0) {
         return res.status(400).json({
           message: "Cannot publish a set without sections"
         });
       }
 
-      // ❗ Validate subjects
+      // ❗ Validate each section
       for (const section of set.sections) {
+
+        // ❗ NEW: Section must have subjects
+        if (!section.subjects || section.subjects.length === 0) {
+          return res.status(400).json({
+            message: `Section "${section.name}" has no subjects`
+          });
+        }
+
+        // ❗ Validate each subject
         for (const subject of section.subjects) {
 
           const totalQuestions = subject.questions.length;
-          const maxQuestions = subject.maxQuestions || 0;
+          const maxQuestions = subject.maxQuestions;
 
-          if (maxQuestions > 0 && totalQuestions !== maxQuestions) {
+          // Safety check (should never be 0 after Step 1 fix)
+          if (!maxQuestions || maxQuestions <= 0) {
+            return res.status(400).json({
+              message: `Invalid maxQuestions in section "${section.name}"`
+            });
+          }
+
+          // ❗ Main validation
+          if (totalQuestions !== maxQuestions) {
             return res.status(400).json({
               message: `Section "${section.name}" → Subject incomplete (${totalQuestions}/${maxQuestions})`
             });
@@ -346,6 +423,7 @@ exports.togglePublishSet = async (req, res) => {
       }
     }
 
+    // Toggle publish state
     set.isPublished = !set.isPublished;
 
     await set.save();
@@ -394,6 +472,8 @@ exports.addSectionToSet = async (req, res) => {
       return res.status(404).json({ message: "Set not found" });
     }
 
+    if (blockIfPublished(set, res)) return;
+
     // Check duplicate section name inside this set
     const sectionExists = set.sections.some(
       (section) => section.name.toLowerCase() === name.toLowerCase()
@@ -434,6 +514,8 @@ exports.addSubjectToSection = async (req, res) => {
       return res.status(404).json({ message: "Set not found" });
     }
 
+    if (blockIfPublished(set, res)) return;
+
     // Find section
     const section = set.sections.find(
       (sec) => sec.name.toLowerCase() === sectionName.toLowerCase()
@@ -453,6 +535,24 @@ exports.addSubjectToSection = async (req, res) => {
     if (subjectExistsAnywhere) {
       return res.status(400).json({
         message: "Subject already assigned in another section of this set"
+      });
+    }
+
+    // Validate maxQuestions
+    if (!maxQuestions || maxQuestions <= 0) {
+      return res.status(400).json({
+        message: "maxQuestions must be greater than 0"
+      });
+    }
+
+    const subjectExists = await Subject.exists({
+      _id: subjectId,
+      isActive: true
+    });
+
+    if (!subjectExists) {
+      return res.status(400).json({
+        message: "Invalid or inactive subject"
       });
     }
 
@@ -485,6 +585,8 @@ exports.addQuestionToSectionSubject = async (req, res) => {
     if (!set) {
       return res.status(404).json({ message: "Set not found" });
     }
+
+    if (blockIfPublished(set, res)) return;
 
     const section = set.sections.find(
       (sec) => sec.name.toLowerCase() === sectionName.toLowerCase()
@@ -549,6 +651,8 @@ exports.removeQuestionFromSectionSubject = async (req, res) => {
     if (!set) {
       return res.status(404).json({ message: "Set not found" });
     }
+
+    if (blockIfPublished(set, res)) return;
 
     const section = set.sections.find(
       (sec) => sec.name.toLowerCase() === sectionName.toLowerCase()
