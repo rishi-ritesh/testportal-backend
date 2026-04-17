@@ -19,14 +19,27 @@ router.delete("/topic/:id", auth, role("admin"), admin.deleteTopic);
 router.post("/questions/bulk-upload", auth, role("admin"), upload.bulkUploadQuestions);
 
 /* QUESTIONS */
+
+// ✅ ADD THIS HERE (before :topicId)
+router.get(
+  "/questions/search-by-code",
+  auth,
+  role("admin"),
+  admin.searchQuestionByCode
+);
+
 router.post("/question", auth, role("admin"), admin.createQuestion);
+
 router.get(
   "/questions/search",
   auth,
   role("admin"),
   admin.searchQuestions
 );
+
+// ❗ KEEP THIS LAST among /questions routes
 router.get("/questions/:topicId", auth, role("admin"), admin.getQuestionsByTopic);
+
 router.delete("/question/:id", auth, role("admin"), admin.deleteQuestion);
 
 
@@ -67,6 +80,13 @@ router.delete(
   auth,
   role("admin"),
   admin.removeQuestionFromSectionSubject
+);
+
+router.post(
+  "/set/check-duplicate",
+  auth,
+  role("admin"),
+  admin.checkDuplicateInSet
 );
 
 module.exports = router;

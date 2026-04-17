@@ -2,6 +2,7 @@ const Subject = require("../models/Subject");
 const Topic = require("../models/Topic");
 const Question = require("../models/Question");
 const SetPaper = require("../models/SetPaper");
+const QuestionCounter = require("../models/QuestionCounter");
 
 const blockIfPublished = (set, res) => {
   if (set.isPublished) {
@@ -101,6 +102,61 @@ exports.deleteTopic = async (req, res) => {
 
 /* ---------------- QUESTIONS ---------------- */
 
+// exports.createQuestion = async (req, res) => {
+//   try {
+//     const {
+//       subjectId,
+//       topicId,
+//       question,
+//       options,
+//       correctAnswer,
+//       explanation
+//     } = req.body;
+
+//     // Basic validations
+//     if (!subjectId || !topicId)
+//       return res.status(400).json({ message: "Subject and Topic required" });
+
+//     if (!question?.en || !question?.hi)
+//       return res.status(400).json({ message: "Bilingual question required" });
+
+//     if (!options || options.length < 2)
+//       return res.status(400).json({ message: "Minimum 2 options required" });
+
+//     if (!correctAnswer) {
+//       return res.status(400).json({
+//         message: "Correct answer is required"
+//       });
+//     }
+
+//     const validKeys = options.map(opt => opt.key);
+
+//     if (!validKeys.includes(correctAnswer))
+//       return res.status(400).json({ message: "Correct answer must match option key" });
+
+//     const newQuestion = await Question.create({
+//       subjectId,
+//       topicId,
+//       question,
+//       options,
+//       correctAnswer,
+//       explanation
+//     });
+
+//     res.json(newQuestion);
+
+//   } catch (err) {
+//     if (err.code === 11000) {
+//       return res.status(400).json({
+//         message: "Duplicate key error",
+//         details: err.keyValue
+//       });
+//     }
+
+//     res.status(500).json({ message: err.message });
+//   }
+// };
+
 exports.createQuestion = async (req, res) => {
   try {
     const {
@@ -122,25 +178,59 @@ exports.createQuestion = async (req, res) => {
     if (!options || options.length < 2)
       return res.status(400).json({ message: "Minimum 2 options required" });
 
+    if (!correctAnswer) {
+      return res.status(400).json({
+        message: "Correct answer is required"
+      });
+    }
+
     const validKeys = options.map(opt => opt.key);
 
     if (!validKeys.includes(correctAnswer))
       return res.status(400).json({ message: "Correct answer must match option key" });
 
+    // ✅ NEW: Fetch subject & topic
+    const subject = await Subject.findById(subjectId);
+    const topic = await Topic.findById(topicId);
+
+    if (!subject || !topic) {
+      return res.status(400).json({
+        message: "Invalid subject or topic"
+      });
+    }
+
+    // ✅ NEW: Get next counter (atomic)
+    const counter = await QuestionCounter.findOneAndUpdate(
+      { subjectId, topicId },
+      { $inc: { count: 1 } },
+      { new: true, upsert: true }
+    );
+
+    // ✅ NEW: Format number → 0001
+    const number = String(counter.count).padStart(4, "0");
+
+    // ✅ NEW: Build questionCode
+    const questionCode = `${subject.slug}_${topic.slug}_${number}`;
+
+    // ✅ UPDATED: Create question with questionCode
     const newQuestion = await Question.create({
       subjectId,
       topicId,
       question,
       options,
       correctAnswer,
-      explanation
+      explanation,
+      questionCode
     });
 
     res.json(newQuestion);
 
   } catch (err) {
     if (err.code === 11000) {
-      return res.status(400).json({ message: "Question already exists (English duplicate)" });
+      return res.status(400).json({
+        message: "Duplicate key error",
+        details: err.keyValue
+      });
     }
 
     res.status(500).json({ message: err.message });
@@ -572,10 +662,81 @@ exports.addSubjectToSection = async (req, res) => {
   }
 };
 
+// exports.addQuestionToSectionSubject = async (req, res) => {
+//   try {
+//     const { setId, sectionName, subjectId } = req.params;
+//     const { questionId } = req.body;
+
+//     if (!questionId) {
+//       return res.status(400).json({ message: "Question ID required" });
+//     }
+
+//     const set = await SetPaper.findById(setId);
+//     if (!set) {
+//       return res.status(404).json({ message: "Set not found" });
+//     }
+
+//     if (blockIfPublished(set, res)) return;
+
+//     const section = set.sections.find(
+//       (sec) => sec.name.toLowerCase() === sectionName.toLowerCase()
+//     );
+
+//     if (!section) {
+//       return res.status(404).json({ message: "Section not found" });
+//     }
+
+//     const subject = section.subjects.find(
+//       (sub) => sub.subjectId.toString() === subjectId
+//     );
+
+//     if (!subject) {
+//       return res.status(404).json({ message: "Subject not found in this section" });
+//     }
+
+//     const question = await Question.findOne({
+//       _id: questionId,
+//       subjectId,
+//       isActive: true
+//     });
+
+//     if (!question) {
+//       return res.status(400).json({
+//         message: "Question invalid or does not belong to this subject"
+//       });
+//     }
+
+//     const alreadyExists = subject.questions.some(
+//       (q) => q.questionId.toString() === questionId
+//     );
+
+//     if (alreadyExists) {
+//       return res.status(400).json({
+//         message: "Question already added to this subject"
+//       });
+//     }
+
+//     if (subject.questions.length >= subject.maxQuestions) {
+//       return res.status(400).json({
+//         message: `Maximum ${subject.maxQuestions} questions allowed for this subject`
+//       });
+//     }
+
+//     subject.questions.push({ questionId });
+
+//     await set.save();
+
+//     res.json(set);
+
+//   } catch (err) {
+//     res.status(500).json({ message: err.message });
+//   }
+// };
+
 exports.addQuestionToSectionSubject = async (req, res) => {
   try {
     const { setId, sectionName, subjectId } = req.params;
-    const { questionId } = req.body;
+    const { questionId, force } = req.body;
 
     if (!questionId) {
       return res.status(400).json({ message: "Question ID required" });
@@ -589,7 +750,7 @@ exports.addQuestionToSectionSubject = async (req, res) => {
     if (blockIfPublished(set, res)) return;
 
     const section = set.sections.find(
-      (sec) => sec.name.toLowerCase() === sectionName.toLowerCase()
+      (sec) => sec.name.trim().toLowerCase() === sectionName.trim().toLowerCase()
     );
 
     if (!section) {
@@ -616,6 +777,7 @@ exports.addQuestionToSectionSubject = async (req, res) => {
       });
     }
 
+    // ❗ Prevent same question ID
     const alreadyExists = subject.questions.some(
       (q) => q.questionId.toString() === questionId
     );
@@ -626,6 +788,37 @@ exports.addQuestionToSectionSubject = async (req, res) => {
       });
     }
 
+    // ❗ Fetch existing questions in this subject
+    const existingQuestions = await Question.find({
+      _id: { $in: subject.questions.map(q => q.questionId) }
+    });
+
+    // ❗ Normalize text
+    const normalize = (text) =>
+      text.trim().toLowerCase().replace(/\s+/g, " ");
+
+    const currentText = normalize(question.question.en);
+
+    const duplicate = existingQuestions.find(
+      (q) => normalize(q.question.en) === currentText
+    );
+
+    // ❗ If duplicate text found and not forced
+    // if (duplicate && !force) {
+    //   return res.status(409).json({
+    //     message: "Question with this text already exists in the set. Do you still want to add it?",
+    //     requiresConfirmation: true
+    //   });
+    // }
+
+    if (duplicate && !force) {
+      return res.status(200).json({
+        message: "Question with this text already exists in the set. Do you still want to add it?",
+        requiresConfirmation: true
+      });
+    }
+
+    // ❗ Max question check
     if (subject.questions.length >= subject.maxQuestions) {
       return res.status(400).json({
         message: `Maximum ${subject.maxQuestions} questions allowed for this subject`
@@ -677,6 +870,126 @@ exports.removeQuestionFromSectionSubject = async (req, res) => {
     await set.save();
 
     res.json({ message: "Question removed successfully" });
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.checkDuplicateInSet = async (req, res) => {
+  try {
+    const { setId, sectionName, subjectId, questionText } = req.body;
+
+    const set = await SetPaper.findById(setId);
+
+    const section = set.sections.find(
+      (sec) => sec.name.trim().toLowerCase() === sectionName.trim().toLowerCase()
+    );
+
+    const subject = section.subjects.find(
+      (sub) => sub.subjectId.toString() === subjectId
+    );
+
+    const existingQuestions = await Question.find({
+      _id: { $in: subject.questions.map(q => q.questionId) }
+    });
+
+    const normalize = (text) =>
+      text.trim().toLowerCase().replace(/\s+/g, " ");
+
+    const duplicate = existingQuestions.find(
+      (q) => normalize(q.question.en) === normalize(questionText)
+    );
+
+    res.json({
+      duplicate: !!duplicate,
+      question: duplicate || null
+    });
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.searchQuestionByCode = async (req, res) => {
+  try {
+    const { subjectSlug, topicSlug, code, page = 1, limit = 20 } = req.query;
+
+    // ❗ Case 1: Full questionCode search
+    if (code) {
+      const question = await Question.findOne({
+        questionCode: code,
+        isActive: true
+      });
+
+      if (!question) {
+        return res.status(404).json({
+          message: "Question not found"
+        });
+      }
+
+      return res.json([question]);
+    }
+
+    // ❗ Case 2: subjectSlug + topicSlug required
+    if (!subjectSlug || !topicSlug) {
+      return res.status(400).json({
+        message: "Provide either full code OR subjectSlug + topicSlug"
+      });
+    }
+
+    // Find subject
+    const subject = await Subject.findOne({
+      slug: subjectSlug,
+      isActive: true
+    });
+
+    if (!subject) {
+      return res.status(400).json({
+        message: "Invalid subjectSlug"
+      });
+    }
+
+    // Find topic
+    const topic = await Topic.findOne({
+      slug: topicSlug,
+      subjectId: subject._id,
+      isActive: true
+    });
+
+    if (!topic) {
+      return res.status(400).json({
+        message: "Invalid topicSlug for given subject"
+      });
+    }
+
+    // Pagination
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+
+    // Fetch questions
+    const questions = await Question.find({
+      subjectId: subject._id,
+      topicId: topic._id,
+      isActive: true
+    })
+      .sort({ createdAt: -1 })
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum);
+
+    // Total count
+    const total = await Question.countDocuments({
+      subjectId: subject._id,
+      topicId: topic._id,
+      isActive: true
+    });
+
+    res.json({
+      total,
+      page: pageNum,
+      limit: limitNum,
+      questions
+    });
 
   } catch (err) {
     res.status(500).json({ message: err.message });

@@ -31,11 +31,16 @@ const questionSchema = new mongoose.Schema(
       required: true
     },
 
+    questionCode: {
+      type: String,
+      required: true,
+      unique: true
+    },
+
     question: {
       en: {
         type: String,
         required: true,
-        unique: true, // enforce uniqueness
         trim: true
       },
       hi: {
