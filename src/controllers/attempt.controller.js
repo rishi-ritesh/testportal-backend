@@ -1,0 +1,1996 @@
+// Backend/src/controllers/attempt.controller.js
+
+const Attempt = require("../models/Attempt");
+const SetPaper = require("../models/SetPaper");
+const AttemptAnswer = require("../models/AttemptAnswer");
+const Question = require("../models/Question");
+
+// =========================
+// LIVE RANK HELPER
+// =========================
+// Recomputes rank/percentile for a FIRST attempt against the current
+// first-attempt pool, so it stays correct as better performers finish.
+// Returns nulls for tests with no participants.
+async function computeFirstAttemptRank(testId, finalScore) {
+
+  const totalParticipants =
+    await Attempt.countDocuments({
+      testId,
+      attemptType: "ranked",
+      status: "completed"
+    });
+
+  if (totalParticipants === 0) {
+    return { rank: null, percentile: null, totalParticipants: 0 };
+  }
+
+  const better =
+    await Attempt.countDocuments({
+      testId,
+      attemptType: "ranked",
+      status: "completed",
+      finalScore: { $gt: finalScore }
+    });
+
+  const rank = better + 1;
+
+  const percentile = Number(
+    (
+      ((totalParticipants - rank) / totalParticipants) * 100
+    ).toFixed(2)
+  );
+
+  return { rank, percentile, totalParticipants };
+}
+
+// =========================
+// RESPONSE FORMATTERS
+// =========================
+
+// Flatten a stored testSnapshot into the shape the attempt screen expects.
+function formatSnapshotSections(sections) {
+  return (sections || []).map((section) => ({
+    sectionId: section.sectionId,
+    sectionName: section.sectionName,
+    questions: section.questions.map((q) => ({
+      questionId: q.questionId,
+      questionNumber: q.questionNumber,
+      sectionQuestionNumber: q.sectionQuestionNumber,
+      question: q.question,
+      options: q.options,
+      subject: { id: q.subjectId, name: q.subjectName },
+      topic: { id: q.topicId, name: q.topicName }
+    }))
+  }));
+}
+
+function buildAttemptPayload(attempt) {
+  return {
+    _id: attempt._id,
+    attemptType: attempt.attemptType,
+    status: attempt.status,
+    startedAt: attempt.startedAt,
+    currentSectionIndex: attempt.currentSectionIndex,
+    currentQuestionId: attempt.currentQuestionId,
+    sections: formatSnapshotSections(attempt.testSnapshot.sections)
+  };
+}
+
+exports.startAttempt = async (req, res) => {
+  try {
+
+    const { testId } = req.body;
+
+    // ✅ validation
+    if (!testId) {
+      return res.status(400).json({
+        message: "testId is required"
+      });
+    }
+
+    // ✅ fetch published test
+    const test = await SetPaper.findOne({
+      _id: testId,
+      isPublished: true
+    })
+      .populate("sections.subjects.subjectId")
+      .populate({
+        path: "sections.subjects.questions.questionId",
+        populate: {
+          path: "topicId"
+        }
+      });
+
+    if (!test) {
+      return res.status(404).json({
+        message: "Test not found"
+      });
+    }
+
+    // ✅ snapshot generation
+    let questionNumber = 1;
+
+    const snapshotSections = test.sections.map(
+      (section, sectionIndex) => {
+
+        const questions = [];
+
+        // ✅ section-wise numbering
+        let sectionQuestionNumber = 1;
+
+        section.subjects.forEach((subject) => {
+
+          subject.questions.forEach((q) => {
+
+            questions.push({
+              questionId: q.questionId._id,
+
+              question: {
+                english:
+                  q.questionId.question?.en || "",
+
+                hindi:
+                  q.questionId.question?.hi || ""
+              },
+
+              options:
+                q.questionId.options.map((opt) => ({
+                  key: opt.key,
+
+                  text: {
+                    english:
+                      opt.text?.en || "",
+
+                    hindi:
+                      opt.text?.hi || ""
+                  }
+                })),
+
+              subjectId: subject.subjectId._id,
+
+              subjectName:
+                subject.subjectId.name,
+
+              topicId:
+                q.questionId.topicId?._id,
+
+              topicName:
+                q.questionId.topicId?.name,
+
+              questionNumber,
+
+              sectionQuestionNumber
+            });
+
+            questionNumber++;
+            sectionQuestionNumber++;
+          });
+
+        });
+
+        return {
+          sectionId: String(sectionIndex + 1),
+
+          sectionName: section.name,
+
+          questions
+        };
+      }
+    );
+
+    // =========================
+    // RESOLVE / CREATE ATTEMPT
+    // =========================
+    // Two attempt roles per user+test:
+    //   "ranked"   – the first attempt; the only one counted for ranking.
+    //   "practice" – a single unranked retake for improvement analysis.
+    // In-progress attempts are always resumed (network-safe). A new
+    // practice run only overwrites a previously COMPLETED practice attempt.
+
+    const createAttempt = (attemptType) =>
+      Attempt.create({
+        userId: req.user.id,
+        testId: test._id,
+        attemptType,
+        status: "in_progress",
+        startedAt: new Date(),
+        lastActiveAt: new Date(),
+        currentSectionIndex: 0,
+        currentQuestionId:
+          snapshotSections[0]?.questions[0]?.questionId || null,
+        testSnapshot: { sections: snapshotSections }
+      });
+
+    const rankedAttempt = await Attempt.findOne({
+      userId: req.user.id,
+      testId: test._id,
+      attemptType: "ranked"
+    });
+
+    // 1) No ranked attempt yet → this first attempt becomes the ranked one
+    if (!rankedAttempt) {
+      const created = await createAttempt("ranked");
+      return res.status(201).json({
+        message: "Ranked attempt started",
+        attempt: buildAttemptPayload(created)
+      });
+    }
+
+    // 2) Ranked attempt still in progress → resume it
+    if (rankedAttempt.status !== "completed") {
+      return res.status(200).json({
+        message: "Resuming ranked attempt",
+        attempt: buildAttemptPayload(rankedAttempt)
+      });
+    }
+
+    // 3) Ranked attempt is done → everything beyond is PRACTICE
+    const practiceAttempt = await Attempt.findOne({
+      userId: req.user.id,
+      testId: test._id,
+      attemptType: "practice"
+    });
+
+    //    a) practice in progress → resume it
+    if (practiceAttempt && practiceAttempt.status !== "completed") {
+      return res.status(200).json({
+        message: "Resuming practice attempt",
+        attempt: buildAttemptPayload(practiceAttempt)
+      });
+    }
+
+    //    b) previous practice completed → overwrite it (answers + doc)
+    if (practiceAttempt) {
+      await AttemptAnswer.deleteMany({
+        attemptId: practiceAttempt._id
+      });
+      await Attempt.deleteOne({ _id: practiceAttempt._id });
+    }
+
+    //    c) start a fresh practice attempt
+    const practice = await createAttempt("practice");
+
+    return res.status(201).json({
+      message: "Practice attempt started",
+      attempt: buildAttemptPayload(practice)
+    });
+
+  } catch (err) {
+
+    res.status(500).json({
+      message: err.message
+    });
+  }
+};
+
+// Get Attempt State
+exports.getAttemptState = async (req, res) => {
+  try {
+
+    const { attemptId } = req.params;
+
+    const attempt = await Attempt.findOne({
+      _id: attemptId,
+      userId: req.user.id
+    });
+
+    if (!attempt) {
+      return res.status(404).json({
+        message: "Attempt not found"
+      });
+    }
+
+    // ✅ section durations come from the live SetPaper config
+    // (testSnapshot intentionally stores only question content).
+    // Matched to snapshot sections by name so the client can run timers.
+    const setPaper = await SetPaper.findById(attempt.testId);
+
+    const sectionDurations =
+      (attempt.testSnapshot?.sections || []).map((section) => {
+
+        const config = setPaper?.sections?.find(
+          (s) => s.name === section.sectionName
+        );
+
+        return {
+          sectionId: section.sectionId,
+          sectionName: section.sectionName,
+          durationMinutes: config?.duration || 0
+        };
+      });
+
+    // ✅ previously saved answers, so the UI can restore selections,
+    // skipped/marked states and the question palette on reload/resume.
+    const savedAnswers = await AttemptAnswer.find({
+      attemptId: attempt._id,
+      userId: req.user.id
+    }).select(
+      "questionId questionNumber selectedOption answerStatus markedForReview"
+    );
+
+    const answers = savedAnswers.map((a) => ({
+      questionId: a.questionId,
+      questionNumber: a.questionNumber,
+      selectedOption: a.selectedOption,
+      answerStatus: a.answerStatus,
+      markedForReview: a.markedForReview
+    }));
+
+    res.json({
+      attemptId: attempt._id,
+
+      attemptType: attempt.attemptType,
+
+      status: attempt.status,
+
+      startedAt: attempt.startedAt,
+      lastActiveAt: attempt.lastActiveAt,
+
+      currentSectionIndex: attempt.currentSectionIndex,
+
+      currentQuestionId: attempt.currentQuestionId,
+
+      totalTimeSpent: attempt.totalTimeSpent,
+
+      // ✅ everything the attempt screen needs to render & restore
+      testSnapshot: attempt.testSnapshot,
+
+      submittedSections: attempt.submittedSections || [],
+
+      sectionDurations,
+
+      answers
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      message: err.message
+    });
+  }
+};
+
+// Attempt Answer
+exports.saveAnswer = async (req, res) => {
+  try {
+
+    const {
+      attemptId,
+      questionId,
+      questionNumber,
+
+      selectedOption,
+
+      answerStatus,
+
+      markedForReview,
+
+      timeSpent,
+
+      fromQuestionNumber,
+      toQuestionNumber,
+
+      saveType
+    } = req.body;
+
+    // ✅ validation
+    if (
+      !attemptId ||
+      !questionId ||
+      !questionNumber
+    ) {
+      return res.status(400).json({
+        message: "Missing required fields"
+      });
+    }
+
+    // ✅ verify attempt ownership
+    const attempt = await Attempt.findOne({
+      _id: attemptId,
+      userId: req.user.id
+    });
+
+    if (!attempt) {
+      return res.status(404).json({
+        message: "Attempt not found"
+      });
+    }
+
+    // ✅ prevent editing completed attempt
+    if (attempt.status === "completed") {
+      return res.status(403).json({
+        message: "Attempt already completed"
+      });
+    }
+
+    // ✅ verify question belongs to this attempt
+    let questionExists = false;
+
+    let questionSectionIndex = -1;
+
+    let questionSnapshot = null;
+
+    let sectionSnapshot = null;
+
+    for (
+      let sectionIndex = 0;
+      sectionIndex < attempt.testSnapshot.sections.length;
+      sectionIndex++
+    ) {
+
+      const section =
+        attempt.testSnapshot.sections[sectionIndex];
+
+      const found = section.questions.find(
+        (q) =>
+          String(q.questionId) === String(questionId) &&
+          q.questionNumber === questionNumber
+      );
+
+      if (found) {
+
+        questionExists = true;
+
+        questionSectionIndex = sectionIndex;
+
+        questionSnapshot = found;
+
+        sectionSnapshot = section;
+
+        break;
+      }
+    }
+
+    if (!questionExists) {
+      return res.status(400).json({
+        message: "Question does not belong to this attempt"
+      });
+    }
+
+    // ✅ fetch actual question
+    const question = await Question.findById(questionId);
+
+    if (!question) {
+      return res.status(404).json({
+        message: "Question not found"
+      });
+    }
+
+    // ✅ find section marking scheme
+    const sectionData =
+      attempt.testSnapshot.sections[questionSectionIndex];
+
+    // find actual section config from SetPaper
+    const setPaper = await SetPaper.findById(
+      attempt.testId
+    );
+
+    const actualSection = setPaper.sections.find(
+      (s) => s.name === sectionData.sectionName
+    );
+
+    if (!actualSection) {
+      return res.status(400).json({
+        message: "Section config not found"
+      });
+    }
+
+    // ✅ evaluate answer
+    // Score whenever an option is selected — independent of the
+    // "mark for review" flag, so answered+marked still counts.
+    const correctAnswer = question.correctAnswer;
+
+    let isCorrect = false;
+
+    let marksAwarded = 0;
+
+    if (selectedOption) {
+
+      isCorrect =
+        selectedOption === correctAnswer;
+
+      marksAwarded = isCorrect
+        ? actualSection.positiveMarks
+        : -actualSection.negativeMarks;
+    }
+
+    const isMarked = Boolean(markedForReview);
+
+    // ✅ prevent editing submitted section
+    const lockedSection =
+      (attempt.submittedSections || []).find(
+        (s) => s.sectionIndex === questionSectionIndex
+      );
+
+    if (lockedSection) {
+      return res.status(403).json({
+        message: "Section already submitted"
+      });
+    }
+
+    // =========================
+    // UPDATE CURRENT POSITION
+    // =========================
+
+    if (toQuestionNumber) {
+
+      let nextQuestionId = null;
+
+      let nextSectionIndex = 0;
+
+      for (
+        let sectionIndex = 0;
+        sectionIndex < attempt.testSnapshot.sections.length;
+        sectionIndex++
+      ) {
+
+        const section =
+          attempt.testSnapshot.sections[sectionIndex];
+
+        const nextQuestion = section.questions.find(
+          (q) => q.questionNumber === toQuestionNumber
+        );
+
+        if (nextQuestion) {
+
+          nextQuestionId = nextQuestion.questionId;
+
+          nextSectionIndex = sectionIndex;
+
+          break;
+        }
+      }
+
+      // ✅ update attempt position
+      if (nextQuestionId) {
+
+        attempt.currentQuestionId = nextQuestionId;
+
+        attempt.currentSectionIndex = nextSectionIndex;
+
+        await attempt.save();
+
+        // =========================
+        // VISIT TRACKING
+        // =========================
+
+        const existingVisitedAnswer =
+          await AttemptAnswer.findOne({
+
+            attemptId,
+
+            questionId: nextQuestionId,
+
+            userId: req.user.id
+          });
+
+        // ✅ first time visited
+        if (!existingVisitedAnswer) {
+
+          const nextSection =
+            attempt.testSnapshot.sections[
+            nextSectionIndex
+            ];
+
+          const nextQuestionSnapshot =
+            nextSection.questions.find(
+              (q) =>
+                String(q.questionId) ===
+                String(nextQuestionId)
+            );
+
+          // fetch actual next question
+          const nextQuestion =
+            await Question.findById(
+              nextQuestionId
+            );
+
+          if (
+            nextQuestionSnapshot &&
+            nextQuestion
+          ) {
+
+            await AttemptAnswer.create({
+
+              attemptId,
+
+              userId: req.user.id,
+
+              questionId:
+                nextQuestionId,
+
+              questionNumber:
+                nextQuestionSnapshot.questionNumber,
+
+              sectionId:
+                nextSection.sectionId,
+
+              sectionName:
+                nextSection.sectionName,
+
+              subjectId:
+                nextQuestionSnapshot.subjectId,
+
+              subjectName:
+                nextQuestionSnapshot.subjectName,
+
+              topicId:
+                nextQuestionSnapshot.topicId,
+
+              topicName:
+                nextQuestionSnapshot.topicName,
+
+              selectedOption: null,
+
+              answerStatus: "skipped",
+
+              fromQuestionNumber,
+
+              toQuestionNumber,
+
+              saveType,
+
+              correctAnswer:
+                nextQuestion.correctAnswer,
+
+              isCorrect: false,
+
+              marksAwarded: 0,
+
+              timeSpent: 0
+            });
+          }
+        }
+      }
+    }
+
+    // ✅ check existing answer
+    let answer = await AttemptAnswer.findOne({
+      attemptId,
+      questionId,
+      userId: req.user.id
+    });
+
+    // =========================
+    // UPDATE EXISTING ANSWER
+    // =========================
+
+    if (answer) {
+
+      answer.selectedOption = selectedOption;
+
+      answer.answerStatus = answerStatus;
+
+      answer.markedForReview = isMarked;
+
+      answer.fromQuestionNumber = fromQuestionNumber;
+
+      answer.toQuestionNumber = toQuestionNumber;
+
+      answer.saveType = saveType;
+
+      answer.correctAnswer = correctAnswer;
+
+      answer.isCorrect = isCorrect;
+
+      answer.marksAwarded = marksAwarded;
+
+      // accumulate time
+      answer.timeSpent += Number(timeSpent || 0);
+
+      await answer.save();
+
+      return res.json({
+        message: "Answer updated",
+        answer
+      });
+    }
+
+    // =========================
+    // CREATE NEW ANSWER
+    // =========================
+
+    answer = await AttemptAnswer.create({
+
+      attemptId,
+
+      userId: req.user.id,
+
+      questionId,
+
+      questionNumber,
+
+      sectionId: sectionSnapshot.sectionId,
+
+      sectionName: sectionSnapshot.sectionName,
+
+      subjectId: questionSnapshot.subjectId,
+
+      subjectName: questionSnapshot.subjectName,
+
+      topicId: questionSnapshot.topicId,
+
+      topicName: questionSnapshot.topicName,
+
+      selectedOption,
+
+      answerStatus,
+
+      markedForReview: isMarked,
+
+      fromQuestionNumber,
+
+      toQuestionNumber,
+
+      saveType,
+
+      correctAnswer,
+
+      isCorrect,
+
+      marksAwarded,
+
+      timeSpent: Number(timeSpent || 0)
+    });
+
+    res.status(201).json({
+      message: "Answer saved",
+      answer
+    });
+
+  } catch (err) {
+
+    res.status(500).json({
+      message: err.message
+    });
+  }
+};
+
+// Section Submit
+exports.submitSection = async (req, res) => {
+  try {
+
+    const { attemptId } = req.body;
+
+    if (!attemptId) {
+      return res.status(400).json({
+        message: "attemptId is required"
+      });
+    }
+
+    // ✅ find attempt
+    const attempt = await Attempt.findOne({
+      _id: attemptId,
+      userId: req.user.id
+    });
+
+    if (!attempt) {
+      return res.status(404).json({
+        message: "Attempt not found"
+      });
+    }
+
+    // ✅ prevent editing completed attempt
+    if (attempt.status === "completed") {
+      return res.status(403).json({
+        message: "Attempt already completed"
+      });
+    }
+
+    // current section
+    const currentSectionIndex =
+      attempt.currentSectionIndex;
+
+    // total sections
+    const totalSections =
+      attempt.testSnapshot.sections.length;
+
+    // ✅ already submitted check
+    const alreadySubmitted =
+      (attempt.submittedSections || []).find(
+        (s) => s.sectionIndex === currentSectionIndex
+      );
+
+    if (alreadySubmitted) {
+      return res.status(400).json({
+        message: "Section already submitted"
+      });
+    }
+
+    // ✅ lock section
+    attempt.submittedSections.push({
+      sectionIndex: currentSectionIndex,
+      submittedAt: new Date()
+    });
+
+    // =========================
+    // LAST SECTION
+    // =========================
+
+    if (currentSectionIndex === totalSections - 1) {
+
+      // ✅ complete test
+      attempt.status = "completed";
+
+      // =========================
+      // GENERATE FINAL RESULT
+      // =========================
+
+      const answers = await AttemptAnswer.find({
+        attemptId,
+        userId: req.user.id
+      });
+
+      let correct = 0;
+
+      let wrong = 0;
+
+      let attempted = 0;
+
+      let finalScore = 0;
+
+      answers.forEach((answer) => {
+
+        finalScore +=
+          answer.marksAwarded || 0;
+
+        if (
+          answer.answerStatus ===
+          "answered"
+        ) {
+
+          attempted++;
+
+          if (answer.isCorrect) {
+            correct++;
+          } else {
+            wrong++;
+          }
+        }
+      });
+
+      // ✅ accuracy
+      const accuracy =
+        attempted > 0
+          ? Number(
+            (
+              (correct / attempted) * 100
+            ).toFixed(2)
+          )
+          : 0;
+
+      // =========================
+      // SAVE FINAL STATS
+      // =========================
+
+      attempt.finalScore = finalScore;
+
+      attempt.correctCount = correct;
+
+      attempt.wrongCount = wrong;
+
+      attempt.attemptedCount = attempted;
+
+      attempt.accuracy = accuracy;
+
+      attempt.resultGenerated = true;
+
+      await attempt.save();
+
+      // =========================
+      // RANK CALCULATION
+      // =========================
+      // Ranking is based on RANKED (first) attempts only. A practice
+      // attempt is neither ranked nor part of the pool.
+
+      if (attempt.attemptType === "ranked") {
+
+        const betterAttempts =
+          await Attempt.countDocuments({
+
+            testId: attempt.testId,
+
+            attemptType: "ranked",
+
+            status: "completed",
+
+            finalScore: {
+              $gt: finalScore
+            }
+          });
+
+        // ✅ rank
+        const rank =
+          betterAttempts + 1;
+
+        // =========================
+        // PERCENTILE
+        // =========================
+
+        const totalParticipants =
+          await Attempt.countDocuments({
+
+            testId: attempt.testId,
+
+            attemptType: "ranked",
+
+            status: "completed"
+          });
+
+        const percentile =
+          totalParticipants > 0
+            ? Number(
+              (
+                (
+                  (
+                    totalParticipants -
+                    rank
+                  ) /
+                  totalParticipants
+                ) * 100
+              ).toFixed(2)
+            )
+            : 0;
+
+        // ✅ save rank data
+        attempt.rank = rank;
+
+        attempt.percentile = percentile;
+
+      } else {
+
+        // practice attempt → not ranked
+        attempt.rank = null;
+
+        attempt.percentile = null;
+      }
+
+      await attempt.save();
+
+      return res.json({
+
+        message: "Test completed",
+
+        attempt: {
+
+          _id: attempt._id,
+
+          status: attempt.status,
+
+          finalScore:
+            attempt.finalScore,
+
+          correctCount:
+            attempt.correctCount,
+
+          wrongCount:
+            attempt.wrongCount,
+
+          attemptedCount:
+            attempt.attemptedCount,
+
+          accuracy:
+            attempt.accuracy,
+
+          rank:
+            attempt.rank,
+
+          percentile:
+            attempt.percentile
+        }
+      });
+    }
+
+    // =========================
+    // MOVE TO NEXT SECTION
+    // =========================
+
+    attempt.currentSectionIndex += 1;
+
+    // first question of next section
+    const nextSection =
+      attempt.testSnapshot.sections[
+      attempt.currentSectionIndex
+      ];
+
+    attempt.currentQuestionId =
+      nextSection.questions[0]?.questionId || null;
+
+    await attempt.save();
+
+    res.json({
+      message: "Section submitted",
+      attempt
+    });
+
+  } catch (err) {
+
+    res.status(500).json({
+      message: err.message
+    });
+  }
+};
+
+// Get Result
+exports.getResult = async (req, res) => {
+  try {
+
+    const { attemptId } = req.params;
+
+    // ✅ verify attempt
+    const attempt = await Attempt.findOne({
+      _id: attemptId,
+      userId: req.user.id
+    });
+
+    if (!attempt) {
+      return res.status(404).json({
+        message: "Attempt not found"
+      });
+    }
+
+    // ✅ fetch answers
+    const answers = await AttemptAnswer.find({
+      attemptId,
+      userId: req.user.id
+    });
+
+    // ✅ create answers map
+    const answersMap = {};
+
+    answers.forEach((answer) => {
+
+      answersMap[
+        String(answer.questionId)
+      ] = answer;
+    });
+
+    // =========================
+    // RANKING POOL = RANKED ATTEMPTS ONLY
+    // =========================
+    // All competition/leaderboard analytics (participants, topper,
+    // averages, per-question difficulty) are computed over each user's
+    // RANKED (first) completed attempt only. Practice attempts excluded.
+
+    const firstAttemptIds =
+      await Attempt.find({
+        testId: attempt.testId,
+        attemptType: "ranked",
+        status: "completed"
+      }).distinct("_id");
+
+    const firstAttemptCount = firstAttemptIds.length;
+
+    // =========================
+    // EXPLANATIONS (for solution panel)
+    // =========================
+    // Snapshots store question + options but not explanations, so we
+    // batch-fetch them once and key by questionId.
+
+    const allQuestionIds = [];
+
+    for (
+      const section of attempt.testSnapshot.sections
+    ) {
+      for (const q of section.questions) {
+        allQuestionIds.push(q.questionId);
+      }
+    }
+
+    const questionDocs = await Question.find({
+      _id: { $in: allQuestionIds }
+    }).select("explanation");
+
+    const explanationMap = {};
+
+    questionDocs.forEach((q) => {
+      explanationMap[String(q._id)] = {
+        english: q.explanation?.en || "",
+        hindi: q.explanation?.hi || ""
+      };
+    });
+
+    // =========================
+    // OVERALL STATS
+    // =========================
+
+    let totalQuestions = 0;
+
+    let attempted = 0;
+
+    let correct = 0;
+
+    let wrong = 0;
+
+    let skipped = 0;
+
+    let notVisited = 0;
+
+    let markedForReview = 0;
+
+    let score = 0;
+
+    let totalTimeSpent = 0;
+
+    // =========================
+    // ANALYTICS CONTAINERS
+    // =========================
+
+    const subjectStats = {};
+
+    const topicStats = {};
+
+    const questionAnalysis = [];
+
+    // =========================
+    // ITERATE ALL QUESTIONS
+    // =========================
+
+    for (
+      const section of
+      attempt.testSnapshot.sections
+    ) {
+
+      for (
+        const question of
+        section.questions
+      ) {
+
+        totalQuestions++;
+
+        const answer =
+          answersMap[
+          String(question.questionId)
+          ];
+
+        // =========================
+        // DEFAULT QUESTION DATA
+        // =========================
+
+        const analysis = {
+
+          questionId:
+            question.questionId,
+
+          questionNumber:
+            question.questionNumber,
+
+          sectionQuestionNumber:
+            question.sectionQuestionNumber,
+
+          sectionName:
+            section.sectionName,
+
+          subjectId:
+            question.subjectId,
+
+          subjectName:
+            question.subjectName,
+
+          topicId:
+            question.topicId,
+
+          topicName:
+            question.topicName,
+
+          // ── content for the solution panel ──
+          questionText: question.question,
+
+          options: question.options,
+
+          explanation:
+            explanationMap[
+              String(question.questionId)
+            ] || { english: "", hindi: "" },
+
+          selectedOption: null,
+
+          correctAnswer: null,
+
+          isCorrect: false,
+
+          marksAwarded: 0,
+
+          timeSpent: 0,
+
+          markedForReview: false,
+
+          answerStatus: "not_visited"
+        };
+
+        // =========================
+        // SUBJECT STATS INIT
+        // =========================
+
+        if (
+          !subjectStats[
+          question.subjectName
+          ]
+        ) {
+
+          subjectStats[
+            question.subjectName
+          ] = {
+
+            subjectName:
+              question.subjectName,
+
+            correct: 0,
+
+            wrong: 0,
+
+            attempted: 0,
+
+            unattempted: 0,
+
+            markedForReview: 0,
+
+            totalTimeSpent: 0,
+
+            score: 0
+          };
+        }
+
+        const subject =
+          subjectStats[
+          question.subjectName
+          ];
+
+        // =========================
+        // TOPIC STATS INIT
+        // =========================
+
+        if (
+          !topicStats[
+          question.topicName
+          ]
+        ) {
+
+          topicStats[
+            question.topicName
+          ] = {
+
+            topicName:
+              question.topicName,
+
+            subjectName:
+              question.subjectName,
+
+            correct: 0,
+
+            wrong: 0,
+
+            attempted: 0,
+
+            unattempted: 0,
+
+            markedForReview: 0,
+
+            totalTimeSpent: 0,
+
+            score: 0
+          };
+        }
+
+        const topic =
+          topicStats[
+          question.topicName
+          ];
+
+        // =========================
+        // IF ANSWER EXISTS
+        // =========================
+
+        if (answer) {
+
+          analysis.selectedOption =
+            answer.selectedOption;
+
+          analysis.correctAnswer =
+            answer.correctAnswer;
+
+          analysis.isCorrect =
+            answer.isCorrect;
+
+          analysis.marksAwarded =
+            answer.marksAwarded;
+
+          analysis.timeSpent =
+            answer.timeSpent;
+
+          analysis.answerStatus =
+            answer.answerStatus;
+
+          analysis.markedForReview =
+            Boolean(answer.markedForReview);
+
+          score +=
+            answer.marksAwarded || 0;
+
+          totalTimeSpent +=
+            answer.timeSpent || 0;
+
+          subject.totalTimeSpent +=
+            answer.timeSpent || 0;
+
+          topic.totalTimeSpent +=
+            answer.timeSpent || 0;
+
+          subject.score +=
+            answer.marksAwarded || 0;
+
+          topic.score +=
+            answer.marksAwarded || 0;
+
+          // =========================
+          // ANSWERED  (counts even if also marked)
+          // =========================
+
+          if (
+            answer.answerStatus ===
+            "answered"
+          ) {
+
+            attempted++;
+
+            subject.attempted++;
+
+            topic.attempted++;
+
+            if (answer.isCorrect) {
+
+              correct++;
+
+              subject.correct++;
+
+              topic.correct++;
+
+            } else {
+
+              wrong++;
+
+              subject.wrong++;
+
+              topic.wrong++;
+            }
+          }
+
+          // =========================
+          // NOT ANSWERED (skipped / marked-only / legacy)
+          // =========================
+
+          else {
+
+            skipped++;
+
+            subject.unattempted++;
+
+            topic.unattempted++;
+          }
+
+          // =========================
+          // MARKED FOR REVIEW (independent flag)
+          // =========================
+
+          if (
+            answer.markedForReview ||
+            answer.answerStatus === "marked_for_review"
+          ) {
+
+            markedForReview++;
+
+            subject.markedForReview++;
+
+            topic.markedForReview++;
+          }
+
+        }
+
+        // =========================
+        // NOT VISITED
+        // =========================
+
+        else {
+
+          notVisited++;
+
+          subject.unattempted++;
+
+          topic.unattempted++;
+        }
+
+        // =========================
+        // QUESTION COMPETITION STATS
+        // =========================
+
+        const questionAttempts =
+          await AttemptAnswer.find({
+
+            questionId: question.questionId,
+
+            // first-attempt pool only
+            attemptId: { $in: firstAttemptIds },
+
+            answerStatus: "answered"
+          });
+
+        const totalQuestionAttempts =
+          questionAttempts.length;
+
+        const correctAttempts =
+          questionAttempts.filter(
+            (a) => a.isCorrect
+          ).length;
+
+        const wrongAttempts =
+          totalQuestionAttempts -
+          correctAttempts;
+
+        // skipped count (denominator = first-attempt participants)
+        const totalCompletedAttempts =
+          firstAttemptCount;
+
+        const skippedAttempts =
+          Math.max(
+            totalCompletedAttempts -
+            totalQuestionAttempts,
+            0
+          );
+
+        // correct %
+        const correctRate =
+          totalQuestionAttempts > 0
+            ? Number(
+              (
+                (
+                  correctAttempts /
+                  totalQuestionAttempts
+                ) * 100
+              ).toFixed(2)
+            )
+            : 0;
+
+        // wrong %
+        const wrongRate =
+          totalQuestionAttempts > 0
+            ? Number(
+              (
+                (
+                  wrongAttempts /
+                  totalQuestionAttempts
+                ) * 100
+              ).toFixed(2)
+            )
+            : 0;
+
+        // skip %
+        const skipRate =
+          totalCompletedAttempts > 0
+            ? Number(
+              (
+                (
+                  skippedAttempts /
+                  totalCompletedAttempts
+                ) * 100
+              ).toFixed(2)
+            )
+            : 0;
+
+        // =========================
+        // TIME ANALYTICS
+        // =========================
+
+        const times =
+          questionAttempts
+            .map((a) => a.timeSpent || 0)
+            .filter((t) => t > 0)
+            .sort((a, b) => a - b);
+
+        // avg time
+        const avgTimeSpent =
+          times.length > 0
+            ? Number(
+              (
+                times.reduce(
+                  (sum, t) => sum + t,
+                  0
+                ) / times.length
+              ).toFixed(2)
+            )
+            : 0;
+
+        // median time
+        let medianTimeSpent = 0;
+
+        if (times.length > 0) {
+
+          const middle =
+            Math.floor(times.length / 2);
+
+          if (times.length % 2 === 0) {
+
+            medianTimeSpent =
+              Number(
+                (
+                  (
+                    times[middle - 1] +
+                    times[middle]
+                  ) / 2
+                ).toFixed(2)
+              );
+
+          } else {
+
+            medianTimeSpent =
+              times[middle];
+          }
+        }
+
+        // topper time (topper among first attempts)
+        const topperAttempt =
+          await Attempt.findOne({
+
+            _id: { $in: firstAttemptIds }
+          })
+            .sort({
+              finalScore: -1
+            });
+
+        let topperTimeSpent = 0;
+
+        if (topperAttempt) {
+
+          const topperAnswer =
+            await AttemptAnswer.findOne({
+
+              attemptId: topperAttempt._id,
+
+              questionId: question.questionId
+            });
+
+          topperTimeSpent =
+            topperAnswer?.timeSpent || 0;
+        }
+
+        // =========================
+        // DIFFICULTY
+        // =========================
+        // Empirical, based on the % of first-attempt answerers who got it
+        // right. With no answers yet there is no data → "unrated" (instead
+        // of misleadingly defaulting to "hard").
+
+        let difficulty = "unrated";
+
+        if (totalQuestionAttempts > 0) {
+
+          if (correctRate >= 80) {
+            difficulty = "easy";
+          }
+
+          else if (correctRate < 50) {
+            difficulty = "hard";
+          }
+
+          else {
+            difficulty = "medium";
+          }
+        }
+
+        // =========================
+        // ATTACH STATS
+        // =========================
+
+        analysis.competitionStats = {
+
+          totalAttempts:
+            totalQuestionAttempts,
+
+          correctRate,
+
+          wrongRate,
+
+          skipRate,
+
+          avgTimeSpent,
+
+          medianTimeSpent,
+
+          topperTimeSpent,
+
+          difficulty
+        };
+
+        // =========================
+        // PUSH QUESTION ANALYSIS
+        // =========================
+
+        questionAnalysis.push(
+          analysis
+        );
+      }
+    }
+
+    // =========================
+    // OVERALL ACCURACY
+    // =========================
+
+    const accuracy =
+      attempted > 0
+        ? Number(
+          (
+            (correct / attempted) * 100
+          ).toFixed(2)
+        )
+        : 0;
+
+    // =========================
+    // FINALIZE SUBJECTS
+    // =========================
+
+    const subjects = Object.values(
+      subjectStats
+    ).map((subject) => ({
+
+      ...subject,
+
+      accuracy:
+        subject.attempted > 0
+          ? Number(
+            (
+              (subject.correct /
+                subject.attempted) * 100
+            ).toFixed(2)
+          )
+          : 0,
+
+      avgTimeSpent:
+        subject.attempted > 0
+          ? Number(
+            (
+              subject.totalTimeSpent /
+              subject.attempted
+            ).toFixed(2)
+          )
+          : 0
+    }));
+
+    // =========================
+    // FINALIZE TOPICS
+    // =========================
+
+    const topics = Object.values(
+      topicStats
+    ).map((topic) => ({
+
+      ...topic,
+
+      accuracy:
+        topic.attempted > 0
+          ? Number(
+            (
+              (topic.correct /
+                topic.attempted) * 100
+            ).toFixed(2)
+          )
+          : 0,
+
+      avgTimeSpent:
+        topic.attempted > 0
+          ? Number(
+            (
+              topic.totalTimeSpent /
+              topic.attempted
+            ).toFixed(2)
+          )
+          : 0
+    }));
+
+    // =========================
+    // COMPETITION STATS
+    // =========================
+
+    // total participants (first attempts only)
+    const totalParticipants = firstAttemptCount;
+
+    // topper (among first attempts)
+    const topperAttempt =
+      await Attempt.findOne({
+
+        _id: { $in: firstAttemptIds }
+      })
+        .sort({
+          finalScore: -1
+        });
+
+    // average score + accuracy (first attempts only)
+    const aggregateStats =
+      await Attempt.aggregate([
+
+        {
+          $match: {
+            _id: { $in: firstAttemptIds }
+          }
+        },
+
+        {
+          $group: {
+
+            _id: null,
+
+            averageScore: {
+              $avg: "$finalScore"
+            },
+
+            averageAccuracy: {
+              $avg: "$accuracy"
+            }
+          }
+        }
+      ]);
+
+    const averageScore =
+      aggregateStats[0]?.averageScore || 0;
+
+    const averageAccuracy =
+      aggregateStats[0]?.averageAccuracy || 0;
+
+    // final competition stats
+    // Live rank/percentile — recomputed against the current ranked-attempt
+    // pool so it stays correct as better performers finish. Practice
+    // attempts remain unranked.
+    let liveRank = null;
+    let livePercentile = null;
+
+    if (
+      attempt.attemptType === "ranked" &&
+      attempt.status === "completed"
+    ) {
+      const ranked = await computeFirstAttemptRank(
+        attempt.testId,
+        attempt.finalScore
+      );
+      liveRank = ranked.rank;
+      livePercentile = ranked.percentile;
+    }
+
+    const competitionStats = {
+
+      totalParticipants,
+
+      rank: liveRank,
+
+      percentile: livePercentile,
+
+      topperScore:
+        topperAttempt?.finalScore || 0,
+
+      topperAccuracy:
+        topperAttempt?.accuracy || 0,
+
+      averageScore:
+        Number(
+          averageScore.toFixed(2)
+        ),
+
+      averageAccuracy:
+        Number(
+          averageAccuracy.toFixed(2)
+        )
+    };
+
+    // =========================
+    // IMPROVEMENT ANALYSIS
+    // =========================
+    // A practice attempt is compared against the user's ranked (first)
+    // attempt for the same test, so they can see their improvement.
+
+    let improvement = null;
+
+    if (attempt.attemptType === "practice") {
+
+      const rankedAttempt = await Attempt.findOne({
+        userId: req.user.id,
+        testId: attempt.testId,
+        attemptType: "ranked",
+        status: "completed"
+      });
+
+      if (rankedAttempt) {
+        improvement = {
+          rankedScore: rankedAttempt.finalScore,
+          rankedAccuracy: rankedAttempt.accuracy,
+          rankedCorrect: rankedAttempt.correctCount,
+
+          scoreDelta:
+            Number((score - rankedAttempt.finalScore).toFixed(2)),
+          accuracyDelta:
+            Number((accuracy - rankedAttempt.accuracy).toFixed(2)),
+          correctDelta:
+            correct - rankedAttempt.correctCount
+        };
+      }
+    }
+
+    // =========================
+    // RESPONSE
+    // =========================
+
+    res.json({
+
+      attemptId,
+
+      attemptType: attempt.attemptType,
+
+      improvement,
+
+      status: attempt.status,
+
+      totalQuestions,
+
+      attempted,
+
+      correct,
+
+      wrong,
+
+      skipped,
+
+      notVisited,
+
+      markedForReview,
+
+      score,
+
+      accuracy,
+
+      totalTimeSpent,
+
+      subjects,
+
+      topics,
+
+      competitionStats,
+
+      questionAnalysis
+    });
+
+  } catch (err) {
+
+    res.status(500).json({
+      message: err.message
+    });
+  }
+};
+
+// =========================
+// NEXT ATTEMPT INFO
+// =========================
+// Tells the instructions screen what "Start" will do for this test:
+// a ranked attempt, a resume, or an (overwriting) practice attempt.
+exports.getNextAttemptInfo = async (req, res) => {
+  try {
+
+    const { id } = req.params;
+
+    const ranked = await Attempt.findOne({
+      userId: req.user.id,
+      testId: id,
+      attemptType: "ranked"
+    });
+
+    // no ranked attempt yet → next start IS the ranked attempt
+    if (!ranked) {
+      return res.json({
+        nextType: "ranked",
+        resuming: false,
+        rankedCompleted: false
+      });
+    }
+
+    // ranked attempt still in progress → next start resumes it
+    if (ranked.status !== "completed") {
+      return res.json({
+        nextType: "ranked",
+        resuming: true,
+        rankedCompleted: false
+      });
+    }
+
+    // ranked done → next start is a practice attempt
+    const practice = await Attempt.findOne({
+      userId: req.user.id,
+      testId: id,
+      attemptType: "practice"
+    });
+
+    return res.json({
+      nextType: "practice",
+      resuming: Boolean(practice && practice.status !== "completed"),
+      rankedCompleted: true
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      message: err.message
+    });
+  }
+};
+
+// =========================
+// LIST MY ATTEMPTS
+// =========================
+// Returns the logged-in student's attempts (most recent first) so the
+// dashboard can show history and link to resume / result.
+exports.getMyAttempts = async (req, res) => {
+  try {
+
+    const attempts = await Attempt.find({
+      userId: req.user.id
+    })
+      .populate("testId", "title")
+      .sort({ updatedAt: -1 });
+
+    const data = await Promise.all(
+      attempts.map(async (a) => {
+
+        // total questions straight from the snapshot (no extra query)
+        const totalQuestions =
+          (a.testSnapshot?.sections || []).reduce(
+            (sum, s) => sum + (s.questions?.length || 0),
+            0
+          );
+
+        // live rank — ranked completed attempts only; practice unranked
+        let rank = null;
+        let percentile = null;
+
+        if (
+          a.attemptType === "ranked" &&
+          a.status === "completed" &&
+          a.testId?._id
+        ) {
+          const ranked = await computeFirstAttemptRank(
+            a.testId._id,
+            a.finalScore
+          );
+          rank = ranked.rank;
+          percentile = ranked.percentile;
+        }
+
+        return {
+          attemptId: a._id,
+
+          attemptType: a.attemptType,
+
+          testId: a.testId?._id || null,
+
+          testTitle: a.testId?.title || "Untitled Test",
+
+          status: a.status,
+
+          totalQuestions,
+
+          finalScore: a.finalScore,
+
+          accuracy: a.accuracy,
+
+          rank,
+
+          percentile,
+
+          startedAt: a.startedAt,
+
+          // updatedAt doubles as completion time for finished attempts
+          updatedAt: a.updatedAt
+        };
+      })
+    );
+
+    res.json(data);
+
+  } catch (err) {
+
+    res.status(500).json({
+      message: err.message
+    });
+  }
+};

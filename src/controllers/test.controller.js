@@ -1,67 +1,100 @@
-const Test = require("../models/Test");
-const Question = require("../models/Question");
+// Backend/src/controllers/test.controller.js
 
-exports.createTest = async (req, res) => {
+const SetPaper = require("../models/SetPaper");
+
+exports.getPublishedTests = async (req, res) => {
   try {
-    const { title, description, durationMinutes, questions } = req.body;
+    const sets = await SetPaper.find({
+      isPublished: true,
+      isActive: true
+    }).sort({ createdAt: -1 });
 
-    const questionIds = questions.map(q => q.questionId);
-    const count = await Question.countDocuments({ _id: { $in: questionIds } });
+    const formatted = sets.map((set) => {
+      let totalQuestions = 0;
+      let totalDuration = 0;
 
-    if (count !== questionIds.length) {
-      return res.status(400).json({
-        message: "One or more questions do not exist"
+      set.sections.forEach((section) => {
+        totalDuration += section.duration;
+
+        section.subjects.forEach((subject) => {
+          totalQuestions += subject.questions.length;
+        });
       });
-    }
 
-    const test = await Test.create({
-      title: title.trim(),
-      description,
-      durationMinutes,
-      questions,
-      createdBy: req.user.id
+      return {
+        id: set._id,
+        title: set.title,
+        totalSections: set.sections.length,
+        totalQuestions,
+        totalDuration
+      };
     });
 
-    res.json(test);
-  } catch (err) {
-    // 🔥 DUPLICATE TITLE HANDLING
-    if (err.code === 11000 && err.keyPattern?.title) {
-      return res.status(409).json({
-        message: "Mock title already exists. Please use a different title."
-      });
-    }
+    res.json(formatted);
 
+  } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
+exports.getTestById = async (req, res) => {
+  try {
+    const { id } = req.params;
 
-/* 🔥 PUBLISH MOCK */
-exports.publishTest = async (req, res) => {
-  const test = await Test.findByIdAndUpdate(
-    req.params.id,
-    { isPublished: true },
-    { new: true }
-  );
+    const set = await SetPaper.findById(id)
+      .populate("sections.subjects.subjectId")
+      .populate("sections.subjects.questions.questionId");
 
-  if (!test) {
-    return res.status(404).json({ message: "Test not found" });
+    if (!set || !set.isPublished) {
+      return res.status(404).json({ message: "Test not available" });
+    }
+
+    const response = {
+      id: set._id,
+      title: set.title,
+      duration: 0,
+      sections: []
+    };
+
+    for (const section of set.sections) {
+      const sectionData = {
+        name: section.name,
+        duration: section.duration,
+        positiveMarks: section.positiveMarks,
+        negativeMarks: section.negativeMarks,
+        subjects: []
+      };
+
+      response.duration += section.duration;
+
+      for (const subject of section.subjects) {
+        const subjectData = {
+          subjectId: subject.subjectId?._id,
+          subjectName: subject.subjectId?.name,
+          questions: []
+        };
+
+        for (const q of subject.questions) {
+          const question = q.questionId;
+          if (!question) continue;
+
+          subjectData.questions.push({
+            id: question._id,
+            question: question.question,
+            options: question.options
+          });
+        }
+
+        sectionData.subjects.push(subjectData);
+      }
+
+      response.sections.push(sectionData);
+    }
+
+    res.json(response);
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
-
-  res.json(test);
 };
 
-/* 🔥 UNPUBLISH MOCK */
-exports.unpublishTest = async (req, res) => {
-  const test = await Test.findByIdAndUpdate(
-    req.params.id,
-    { isPublished: false },
-    { new: true }
-  );
-
-  if (!test) {
-    return res.status(404).json({ message: "Test not found" });
-  }
-
-  res.json(test);
-};

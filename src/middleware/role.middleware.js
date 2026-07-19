@@ -1,3 +1,5 @@
+// Backend/src/middleware/role.middleware.js
+
 module.exports = (role) => {
   return (req, res, next) => {
     if (req.user.role !== role)

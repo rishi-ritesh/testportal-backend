@@ -3,6 +3,7 @@ const auth = require("../middleware/auth.middleware");
 const role = require("../middleware/role.middleware");
 const admin = require("../controllers/admin.controller");
 const upload = require("../controllers/questionUpload.controller");
+const pkg = require("../controllers/package.controller");
 
 /* SUBJECTS */
 router.post("/subject", auth, role("admin"), admin.createSubject);
@@ -29,6 +30,13 @@ router.get(
 );
 
 router.post("/question", auth, role("admin"), admin.createQuestion);
+
+router.put(
+  "/question/:id",
+  auth,
+  role("admin"),
+  admin.updateQuestion
+);
 
 router.get(
   "/questions/search",
@@ -75,6 +83,14 @@ router.post(
   admin.addQuestionToSectionSubject
 );
 
+/* Bulk-create + add many questions to a subject at once */
+router.post(
+  "/set/:setId/section/:sectionName/subject/:subjectId/questions/bulk",
+  auth,
+  role("admin"),
+  admin.bulkAddQuestionsToSubject
+);
+
 router.delete(
   "/set/:setId/section/:sectionName/subject/:subjectId/question/:questionId",
   auth,
@@ -88,5 +104,16 @@ router.post(
   role("admin"),
   admin.checkDuplicateInSet
 );
+
+
+/* PACKAGES (TEST SERIES) */
+router.post("/package", auth, role("admin"), pkg.createPackage);
+router.get("/packages", auth, role("admin"), pkg.getPackages);
+router.get("/package/:id", auth, role("admin"), pkg.getPackageById);
+router.patch("/package/:id", auth, role("admin"), pkg.updatePackage);
+router.delete("/package/:id", auth, role("admin"), pkg.deletePackage);
+router.patch("/package/:id/publish", auth, role("admin"), pkg.togglePublishPackage);
+router.post("/package/:id/set/:setId", auth, role("admin"), pkg.addSetToPackage);
+router.delete("/package/:id/set/:setId", auth, role("admin"), pkg.removeSetFromPackage);
 
 module.exports = router;

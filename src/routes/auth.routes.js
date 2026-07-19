@@ -1,3 +1,5 @@
+// Backend/src/routes/auth.routes.js
+
 const router = require("express").Router();
 const auth = require("../controllers/auth.controller");
 
