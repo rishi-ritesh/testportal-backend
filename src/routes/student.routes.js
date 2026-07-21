@@ -12,6 +12,9 @@ const {
   getAttemptState,
   saveAnswer,
   submitSection,
+  pauseAttempt,
+  resumeAttempt,
+  syncTimer,
   getResult,
   getMyAttempts,
   getNextAttemptInfo
@@ -79,6 +82,13 @@ router.post(
   student,
   submitSection
 );
+
+// Pause / Resume Attempt
+router.post("/attempt/pause", auth, student, pauseAttempt);
+router.post("/attempt/resume", auth, student, resumeAttempt);
+
+// Persist the section timer (heartbeat / tab close)
+router.post("/attempt/timer", auth, student, syncTimer);
 
 // Get Result
 router.get(

@@ -64,6 +64,34 @@ function formatSnapshotSections(sections) {
   }));
 }
 
+// Answer fields that are SAFE to send back to a student during a live attempt.
+// Never expose correctAnswer / isCorrect / marksAwarded here — that would let
+// anyone reading the network response see the answer key mid-test.
+function publicAnswer(a) {
+  return {
+    _id: a._id,
+    questionId: a.questionId,
+    questionNumber: a.questionNumber,
+    selectedOption: a.selectedOption,
+    answerStatus: a.answerStatus,
+    markedForReview: a.markedForReview,
+    timeSpent: a.timeSpent
+  };
+}
+
+// Duration (minutes) configured for a section, matched by name from SetPaper.
+function sectionDurationMinutes(setPaper, sectionName) {
+  const config = setPaper?.sections?.find((s) => s.name === sectionName);
+  return config?.duration || 0;
+}
+
+// Full section length in seconds (null = untimed). Used to seed the clock when
+// a section starts; from then on the client owns the countdown and syncs it.
+function fullSectionSeconds(setPaper, sectionName) {
+  const min = sectionDurationMinutes(setPaper, sectionName);
+  return min > 0 ? min * 60 : null;
+}
+
 function buildAttemptPayload(attempt) {
   return {
     _id: attempt._id,
@@ -187,6 +215,12 @@ exports.startAttempt = async (req, res) => {
     // In-progress attempts are always resumed (network-safe). A new
     // practice run only overwrites a previously COMPLETED practice attempt.
 
+    // seconds for the first section (client owns the countdown from here)
+    const firstSectionSeconds = (() => {
+      const d = test.sections?.[0]?.duration || 0;
+      return d > 0 ? d * 60 : null;
+    })();
+
     const createAttempt = (attemptType) =>
       Attempt.create({
         userId: req.user.id,
@@ -195,6 +229,8 @@ exports.startAttempt = async (req, res) => {
         status: "in_progress",
         startedAt: new Date(),
         lastActiveAt: new Date(),
+        sectionRemainingSeconds: firstSectionSeconds,
+        pausedAt: null,
         currentSectionIndex: 0,
         currentQuestionId:
           snapshotSections[0]?.questions[0]?.questionId || null,
@@ -286,18 +322,29 @@ exports.getAttemptState = async (req, res) => {
     const setPaper = await SetPaper.findById(attempt.testId);
 
     const sectionDurations =
-      (attempt.testSnapshot?.sections || []).map((section) => {
+      (attempt.testSnapshot?.sections || []).map((section) => ({
+        sectionId: section.sectionId,
+        sectionName: section.sectionName,
+        durationMinutes: sectionDurationMinutes(setPaper, section.sectionName)
+      }));
 
-        const config = setPaper?.sections?.find(
-          (s) => s.name === section.sectionName
-        );
+    // The stored remaining time for the CURRENT section. The client counts it
+    // down and syncs it back, so a reload/resume continues from here (time only
+    // passes while the student is actually on the test). Seed it the first time.
+    const currentSection =
+      attempt.testSnapshot?.sections?.[attempt.currentSectionIndex];
 
-        return {
-          sectionId: section.sectionId,
-          sectionName: section.sectionName,
-          durationMinutes: config?.duration || 0
-        };
-      });
+    let currentSectionRemainingSeconds = attempt.sectionRemainingSeconds;
+    if (currentSectionRemainingSeconds == null && currentSection) {
+      currentSectionRemainingSeconds = fullSectionSeconds(
+        setPaper,
+        currentSection.sectionName
+      );
+      if (currentSectionRemainingSeconds != null && attempt.status !== "completed") {
+        attempt.sectionRemainingSeconds = currentSectionRemainingSeconds;
+        await attempt.save();
+      }
+    }
 
     // ✅ previously saved answers, so the UI can restore selections,
     // skipped/marked states and the question palette on reload/resume.
@@ -338,6 +385,10 @@ exports.getAttemptState = async (req, res) => {
       submittedSections: attempt.submittedSections || [],
 
       sectionDurations,
+
+      // current-section timer + pause state (server-authoritative)
+      currentSectionRemainingSeconds,
+      paused: attempt.status === "paused",
 
       answers
     });
@@ -681,7 +732,7 @@ exports.saveAnswer = async (req, res) => {
 
       return res.json({
         message: "Answer updated",
-        answer
+        answer: publicAnswer(answer)
       });
     }
 
@@ -734,7 +785,7 @@ exports.saveAnswer = async (req, res) => {
 
     res.status(201).json({
       message: "Answer saved",
-      answer
+      answer: publicAnswer(answer)
     });
 
   } catch (err) {
@@ -995,6 +1046,15 @@ exports.submitSection = async (req, res) => {
     attempt.currentQuestionId =
       nextSection.questions[0]?.questionId || null;
 
+    // ✅ seed a fresh clock for the new section
+    const setPaper = await SetPaper.findById(attempt.testId);
+    attempt.sectionRemainingSeconds = fullSectionSeconds(
+      setPaper,
+      nextSection.sectionName
+    );
+    attempt.pausedAt = null;
+    if (attempt.status === "paused") attempt.status = "in_progress";
+
     await attempt.save();
 
     res.json({
@@ -1007,6 +1067,116 @@ exports.submitSection = async (req, res) => {
     res.status(500).json({
       message: err.message
     });
+  }
+};
+
+// Clamp a client-reported remaining so the clock can only ever go DOWN.
+function clampRemaining(stored, reported) {
+  const val = Math.max(0, Math.floor(reported));
+  return stored == null ? val : Math.min(stored, val);
+}
+
+// Persist the current section's remaining seconds (client heartbeat / tab
+// close). The clock only moves while the student is on the screen, so this is
+// simply "save where the countdown is now".
+exports.syncTimer = async (req, res) => {
+  try {
+    const { attemptId, remainingSeconds } = req.body;
+    if (!attemptId || typeof remainingSeconds !== "number") {
+      return res.status(400).json({ message: "attemptId and remainingSeconds are required" });
+    }
+
+    const attempt = await Attempt.findOne({ _id: attemptId, userId: req.user.id });
+    if (!attempt) {
+      return res.status(404).json({ message: "Attempt not found" });
+    }
+    if (attempt.status === "completed") {
+      return res.json({ ok: true }); // ignore late syncs
+    }
+
+    attempt.sectionRemainingSeconds = clampRemaining(
+      attempt.sectionRemainingSeconds,
+      remainingSeconds
+    );
+    await attempt.save();
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Pause — stops the clock (client freezes its countdown). Also stores the
+// remaining the client reports so a reload lands on the same value.
+exports.pauseAttempt = async (req, res) => {
+  try {
+    const { attemptId, remainingSeconds } = req.body;
+    if (!attemptId) {
+      return res.status(400).json({ message: "attemptId is required" });
+    }
+
+    const attempt = await Attempt.findOne({ _id: attemptId, userId: req.user.id });
+    if (!attempt) {
+      return res.status(404).json({ message: "Attempt not found" });
+    }
+    if (attempt.status === "completed") {
+      return res.status(403).json({ message: "Attempt already completed" });
+    }
+
+    if (typeof remainingSeconds === "number") {
+      attempt.sectionRemainingSeconds = clampRemaining(
+        attempt.sectionRemainingSeconds,
+        remainingSeconds
+      );
+    }
+
+    if (attempt.status !== "paused") {
+      attempt.status = "paused";
+      attempt.pausedAt = new Date();
+    }
+
+    await attempt.save();
+
+    res.json({
+      message: "Attempt paused",
+      paused: true,
+      currentSectionRemainingSeconds: attempt.sectionRemainingSeconds
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Resume — clears the paused flag and returns the stored remaining so the
+// client picks the countdown back up from exactly where it stopped.
+exports.resumeAttempt = async (req, res) => {
+  try {
+    const { attemptId } = req.body;
+    if (!attemptId) {
+      return res.status(400).json({ message: "attemptId is required" });
+    }
+
+    const attempt = await Attempt.findOne({ _id: attemptId, userId: req.user.id });
+    if (!attempt) {
+      return res.status(404).json({ message: "Attempt not found" });
+    }
+    if (attempt.status === "completed") {
+      return res.status(403).json({ message: "Attempt already completed" });
+    }
+
+    if (attempt.status === "paused") {
+      attempt.pausedAt = null;
+      attempt.status = "in_progress";
+      await attempt.save();
+    }
+
+    res.json({
+      message: "Attempt resumed",
+      paused: false,
+      currentSectionRemainingSeconds: attempt.sectionRemainingSeconds
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
 };
 

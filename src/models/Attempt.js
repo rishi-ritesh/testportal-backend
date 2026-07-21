@@ -33,6 +33,23 @@ const AttemptSchema = new mongoose.Schema({
     startedAt: Date,
     lastActiveAt: Date,
 
+    // ===== Section timer (client-driven, server-persisted) =====
+    // Remaining seconds for the CURRENT section. The clock only advances while
+    // the student is actively on the test screen; the client periodically saves
+    // this value (and on tab close), so a refresh / power cut / accident resumes
+    // from here with no time lost while away. Null = untimed section.
+    // This is a PRACTICE product, so the timer is a helper, not a hard gate.
+    sectionRemainingSeconds: {
+        type: Number,
+        default: null
+    },
+
+    // Set while the attempt is explicitly paused; drives the paused overlay.
+    pausedAt: {
+        type: Date,
+        default: null
+    },
+
     currentSectionIndex: {
         type: Number,
         default: 0
