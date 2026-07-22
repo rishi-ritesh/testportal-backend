@@ -20,6 +20,12 @@ const {
   getNextAttemptInfo
 } = require("../controllers/attempt.controller");
 
+const {
+  toggleBookmark,
+  getBookmarkIds,
+  getBookmarks
+} = require("../controllers/bookmark.controller");
+
 // Get Test List
 router.get("/tests", auth, student, test.getPublishedTests);
 
@@ -97,5 +103,10 @@ router.get(
   student,
   getResult
 );
+
+// Bookmarks
+router.get("/bookmarks", auth, student, getBookmarks);
+router.get("/bookmarks/ids", auth, student, getBookmarkIds);
+router.post("/bookmark/:questionId", auth, student, toggleBookmark);
 
 module.exports = router;

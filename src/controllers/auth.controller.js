@@ -35,6 +35,13 @@ exports.login = async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ message: "Invalid credentials" });
 
+    // blocked accounts can't log in
+    if (user.isActive === false) {
+      return res.status(403).json({
+        message: "Your account has been blocked. Please contact the administrator."
+      });
+    }
+
     const token = jwt.sign(
       { id: user._id, role: user.role },
       process.env.JWT_SECRET,

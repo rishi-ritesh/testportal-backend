@@ -4,6 +4,7 @@ const Attempt = require("../models/Attempt");
 const SetPaper = require("../models/SetPaper");
 const AttemptAnswer = require("../models/AttemptAnswer");
 const Question = require("../models/Question");
+const Package = require("../models/Package");
 
 // =========================
 // LIVE RANK HELPER
@@ -2154,6 +2155,35 @@ exports.getMyAttempts = async (req, res) => {
         };
       })
     );
+
+    // Attribute each attempt to the series (package) that contains its test, so
+    // a student can tell which series a mock came from. A test may be in more
+    // than one package.
+    const testIds = [
+      ...new Set(data.map((d) => d.testId).filter(Boolean).map(String))
+    ];
+
+    if (testIds.length) {
+      const packages = await Package.find({
+        setPapers: { $in: testIds },
+        isActive: true
+      }).select("name setPapers");
+
+      const seriesByTest = new Map();
+      packages.forEach((pkg) => {
+        (pkg.setPapers || []).forEach((sid) => {
+          const key = String(sid);
+          if (!seriesByTest.has(key)) seriesByTest.set(key, []);
+          seriesByTest.get(key).push(pkg.name);
+        });
+      });
+
+      data.forEach((d) => {
+        d.seriesNames = d.testId ? seriesByTest.get(String(d.testId)) || [] : [];
+      });
+    } else {
+      data.forEach((d) => (d.seriesNames = []));
+    }
 
     res.json(data);
 

@@ -20,6 +20,12 @@ const UserSchema = new mongoose.Schema({
     default: "student"
   },
 
+  // Blocked students cannot log in. Absent field = active (legacy users).
+  isActive: {
+    type: Boolean,
+    default: true
+  },
+
   preferences: {
     language: {
       type: String,
@@ -27,6 +33,6 @@ const UserSchema = new mongoose.Schema({
       default: "en"
     }
   }
-});
+}, { timestamps: true });
 
 module.exports = mongoose.model("User", UserSchema);

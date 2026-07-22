@@ -4,6 +4,7 @@ const role = require("../middleware/role.middleware");
 const admin = require("../controllers/admin.controller");
 const upload = require("../controllers/questionUpload.controller");
 const pkg = require("../controllers/package.controller");
+const students = require("../controllers/studentAdmin.controller");
 
 /* SUBJECTS */
 router.post("/subject", auth, role("admin"), admin.createSubject);
@@ -105,6 +106,11 @@ router.post(
   admin.checkDuplicateInSet
 );
 
+
+/* STUDENT MANAGEMENT */
+router.get("/students", auth, role("admin"), students.getStudents);
+router.patch("/student/:id/active", auth, role("admin"), students.toggleStudentActive);
+router.delete("/student/:id", auth, role("admin"), students.deleteStudent);
 
 /* PACKAGES (TEST SERIES) */
 router.post("/package", auth, role("admin"), pkg.createPackage);
