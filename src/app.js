@@ -6,7 +6,21 @@ const mongoose = require("mongoose");
 
 const app = express();
 
-app.use(cors());
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  })
+);
 // bump limit so bulk question uploads (bilingual + explanations) fit
 app.use(express.json({ limit: "5mb" }));
 
