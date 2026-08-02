@@ -5,6 +5,7 @@ const admin = require("../controllers/admin.controller");
 const upload = require("../controllers/questionUpload.controller");
 const pkg = require("../controllers/package.controller");
 const students = require("../controllers/studentAdmin.controller");
+const media = require("../controllers/upload.controller");
 
 /* SUBJECTS */
 router.post("/subject", auth, role("admin"), admin.createSubject);
@@ -16,6 +17,10 @@ router.post("/topic", auth, role("admin"), admin.createTopic);
 router.get("/topics/:subjectId", auth, role("admin"), admin.getTopicsBySubject);
 router.delete("/topic/:id", auth, role("admin"), admin.deleteTopic);
 
+
+/* IMAGE UPLOAD (question / explanation images) */
+router.post("/upload-image", auth, role("admin"), media.receiveImage, media.uploadImage);
+router.post("/delete-image", auth, role("admin"), media.deleteImage);
 
 /* Bulk Upload */
 router.post("/questions/bulk-upload", auth, role("admin"), upload.bulkUploadQuestions);
