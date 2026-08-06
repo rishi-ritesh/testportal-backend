@@ -10,11 +10,13 @@ const media = require("../controllers/upload.controller");
 /* SUBJECTS */
 router.post("/subject", auth, role("admin"), admin.createSubject);
 router.get("/subjects", auth, role("admin"), admin.getSubjects);
+router.patch("/subject/:id", auth, role("admin"), admin.updateSubject);
 router.delete("/subject/:id", auth, role("admin"), admin.deleteSubject);
 
 /* TOPICS */
 router.post("/topic", auth, role("admin"), admin.createTopic);
 router.get("/topics/:subjectId", auth, role("admin"), admin.getTopicsBySubject);
+router.patch("/topic/:id", auth, role("admin"), admin.updateTopic);
 router.delete("/topic/:id", auth, role("admin"), admin.deleteTopic);
 
 
@@ -68,10 +70,29 @@ router.patch(
   admin.togglePublishSet
 );
 router.get("/set/:id", auth, role("admin"), admin.getSetById);
+router.patch("/set/:id", auth, role("admin"), admin.updateSet);
+
+/* REORDER sections / subjects / questions inside a set */
+router.patch("/set/:setId/reorder", auth, role("admin"), admin.reorderSetItems);
 
 
 /* ADD SECTIONS TO SET PAPER */
 router.post("/set/:setId/section", auth, role("admin"), admin.addSectionToSet);
+
+/* EDIT / DELETE A SECTION */
+router.patch(
+  "/set/:setId/section/:sectionName",
+  auth,
+  role("admin"),
+  admin.updateSection
+);
+
+router.delete(
+  "/set/:setId/section/:sectionName",
+  auth,
+  role("admin"),
+  admin.deleteSection
+);
 
 /* ADD SUBJECTS TO THE SECTION */
 router.post(
@@ -79,6 +100,21 @@ router.post(
   auth,
   role("admin"),
   admin.addSubjectToSection
+);
+
+/* EDIT / REMOVE A SUBJECT SLOT INSIDE A SECTION */
+router.patch(
+  "/set/:setId/section/:sectionName/subject/:subjectId",
+  auth,
+  role("admin"),
+  admin.updateSubjectInSection
+);
+
+router.delete(
+  "/set/:setId/section/:sectionName/subject/:subjectId",
+  auth,
+  role("admin"),
+  admin.removeSubjectFromSection
 );
 
 /* Add Question To Subject Inside Section */

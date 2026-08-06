@@ -75,6 +75,54 @@ const blockIfPublished = (set, res) => {
   return false;
 };
 
+// Sections are addressed by name in the URL, and names are compared
+// case-insensitively everywhere so "General Awareness" and "general awareness"
+// resolve to the same section.
+const findSectionIndex = (set, sectionName) =>
+  set.sections.findIndex(
+    (sec) => sec.name.toLowerCase() === String(sectionName || "").toLowerCase()
+  );
+
+// Resolves the { section, subject } pair a request targets, or replies with the
+// right 404 and returns null. Saves every set-editing handler from repeating
+// the same two lookups and two error branches.
+const resolveSlot = (set, sectionName, subjectId, res) => {
+  const section = set.sections[findSectionIndex(set, sectionName)];
+  if (!section) {
+    res.status(404).json({ message: "Section not found" });
+    return null;
+  }
+
+  const subject = section.subjects.find(
+    (sub) => sub.subjectId.toString() === subjectId
+  );
+  if (!subject) {
+    res.status(404).json({ message: "Subject not found in this section" });
+    return null;
+  }
+
+  return { section, subject };
+};
+
+// Moves one element of an array from index `from` to index `to`, in place.
+// Returns false when either index is outside the array so callers can 400.
+const moveWithin = (arr, from, to) => {
+  if (
+    !Number.isInteger(from) ||
+    !Number.isInteger(to) ||
+    from < 0 ||
+    to < 0 ||
+    from >= arr.length ||
+    to >= arr.length
+  ) {
+    return false;
+  }
+
+  const [moved] = arr.splice(from, 1);
+  arr.splice(to, 0, moved);
+  return true;
+};
+
 /* ---------------- SUBJECTS ---------------- */
 
 exports.createSubject = async (req, res) => {
@@ -115,6 +163,83 @@ exports.createSubject = async (req, res) => {
 exports.getSubjects = async (req, res) => {
   const subjects = await Subject.find({ isActive: true }).sort({ order: 1 });
   res.json(subjects);
+};
+
+// Rename a subject. The display name can always change, but the slug is baked
+// into every questionCode ever generated under this subject
+// (`${subject.slug}_${topic.slug}_0001`), so it is frozen the moment the first
+// question exists — otherwise the codes on screen would stop matching the slug.
+exports.updateSubject = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, order } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid subject id" });
+    }
+
+    const subject = await Subject.findOne({ _id: id, isActive: true });
+    if (!subject) {
+      return res.status(404).json({ message: "Subject not found" });
+    }
+
+    if (name !== undefined) {
+      if (!String(name).trim()) {
+        return res.status(400).json({ message: "Subject name is required" });
+      }
+
+      const dup = await Subject.findOne({
+        _id: { $ne: id },
+        name: String(name).trim()
+      });
+      if (dup) {
+        return res.status(409).json({
+          message: "Another subject already uses this name"
+        });
+      }
+
+      subject.name = String(name).trim();
+    }
+
+    if (req.body.slug !== undefined) {
+      const slug = slugify(req.body.slug);
+      if (!slug) {
+        return res.status(400).json({
+          message: "Could not build a valid slug — use letters or numbers"
+        });
+      }
+
+      if (slug !== subject.slug) {
+        const questionCount = await Question.countDocuments({ subjectId: id });
+        if (questionCount > 0) {
+          return res.status(400).json({
+            message: `Slug is locked: ${questionCount} question code(s) were generated from "${subject.slug}". You can still rename the subject.`
+          });
+        }
+
+        const dupSlug = await Subject.findOne({ _id: { $ne: id }, slug });
+        if (dupSlug) {
+          return res.status(409).json({
+            message: "Another subject already uses this slug"
+          });
+        }
+
+        subject.slug = slug;
+      }
+    }
+
+    if (order !== undefined) subject.order = Number(order) || 0;
+
+    await subject.save();
+    res.json(subject);
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({
+        message: "A subject with this name or slug already exists"
+      });
+    }
+    res.status(500).json({ message: err.message });
+  }
 };
 
 exports.deleteSubject = async (req, res) => {
@@ -192,6 +317,68 @@ exports.getTopicsBySubject = async (req, res) => {
   });
 
   res.json(topics);
+};
+
+// Same rule as updateSubject: the name is free to change, the slug is frozen
+// once questions carry it inside their questionCode.
+exports.updateTopic = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid topic id" });
+    }
+
+    const topic = await Topic.findOne({ _id: id, isActive: true });
+    if (!topic) {
+      return res.status(404).json({ message: "Topic not found" });
+    }
+
+    if (name !== undefined) {
+      if (!String(name).trim()) {
+        return res.status(400).json({ message: "Topic name is required" });
+      }
+      topic.name = String(name).trim();
+    }
+
+    if (req.body.slug !== undefined) {
+      const slug = slugify(req.body.slug);
+      if (!slug) {
+        return res.status(400).json({
+          message: "Could not build a valid slug — use letters or numbers"
+        });
+      }
+
+      if (slug !== topic.slug) {
+        const questionCount = await Question.countDocuments({ topicId: id });
+        if (questionCount > 0) {
+          return res.status(400).json({
+            message: `Slug is locked: ${questionCount} question code(s) were generated from "${topic.slug}". You can still rename the topic.`
+          });
+        }
+
+        const dup = await Topic.findOne({
+          _id: { $ne: id },
+          subjectId: topic.subjectId,
+          slug,
+          isActive: true
+        });
+        if (dup) {
+          return res.status(409).json({
+            message: `A topic with slug "${slug}" already exists in this subject`
+          });
+        }
+
+        topic.slug = slug;
+      }
+    }
+
+    await topic.save();
+    res.json(topic);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 };
 
 exports.deleteTopic = async (req, res) => {
@@ -554,6 +741,34 @@ exports.createSet = async (req, res) => {
   }
 };
 
+// Rename a set. Titles are unique across sets, so a clash comes back as a
+// friendly 409 instead of a raw duplicate-key 500.
+exports.updateSet = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title } = req.body;
+
+    if (!title || !String(title).trim()) {
+      return res.status(400).json({ message: "Title is required" });
+    }
+
+    const set = await SetPaper.findById(id);
+    if (!set) return res.status(404).json({ message: "Set not found" });
+
+    if (blockIfPublished(set, res)) return;
+
+    set.title = String(title).trim();
+    await set.save();
+
+    res.json(set);
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ message: "Set title must be unique" });
+    }
+    res.status(500).json({ message: err.message });
+  }
+};
+
 exports.getSets = async (req, res) => {
   const sets = await SetPaper.find({ isActive: true }).lean();
 
@@ -867,6 +1082,100 @@ exports.addSectionToSet = async (req, res) => {
   }
 };
 
+// Edit a section that already exists: its name, duration and marking scheme.
+// Every field is optional, so the UI can send only what the admin touched.
+exports.updateSection = async (req, res) => {
+  try {
+    const { setId, sectionName } = req.params;
+    const { name, duration, positiveMarks, negativeMarks } = req.body;
+
+    const set = await SetPaper.findById(setId);
+    if (!set) return res.status(404).json({ message: "Set not found" });
+
+    if (blockIfPublished(set, res)) return;
+
+    const index = findSectionIndex(set, sectionName);
+    if (index === -1) {
+      return res.status(404).json({ message: "Section not found" });
+    }
+
+    const section = set.sections[index];
+
+    if (name !== undefined) {
+      const trimmed = String(name).trim();
+      if (!trimmed) {
+        return res.status(400).json({ message: "Section name is required" });
+      }
+
+      // A rename must not collide with a different section of the same set,
+      // because the name is how every other route addresses this section.
+      const clash = set.sections.some(
+        (sec, i) => i !== index && sec.name.toLowerCase() === trimmed.toLowerCase()
+      );
+      if (clash) {
+        return res.status(400).json({
+          message: "Section name already exists in this set"
+        });
+      }
+
+      section.name = trimmed;
+    }
+
+    for (const [field, value] of [
+      ["duration", duration],
+      ["positiveMarks", positiveMarks],
+      ["negativeMarks", negativeMarks]
+    ]) {
+      if (value === undefined) continue;
+
+      const num = Number(value);
+      if (!Number.isFinite(num)) {
+        return res.status(400).json({ message: `${field} must be a number` });
+      }
+      if (field === "duration" && num <= 0) {
+        return res.status(400).json({
+          message: "Duration must be greater than 0"
+        });
+      }
+      if (num < 0) {
+        return res.status(400).json({ message: `${field} cannot be negative` });
+      }
+
+      section[field] = num;
+    }
+
+    await set.save();
+    res.json(set);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Delete a whole section. Questions inside it are only unlinked from this set —
+// the Question documents themselves stay in the bank and can be reused.
+exports.deleteSection = async (req, res) => {
+  try {
+    const { setId, sectionName } = req.params;
+
+    const set = await SetPaper.findById(setId);
+    if (!set) return res.status(404).json({ message: "Set not found" });
+
+    if (blockIfPublished(set, res)) return;
+
+    const index = findSectionIndex(set, sectionName);
+    if (index === -1) {
+      return res.status(404).json({ message: "Section not found" });
+    }
+
+    set.sections.splice(index, 1);
+    await set.save();
+
+    res.json({ message: "Section removed successfully", set });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 exports.addSubjectToSection = async (req, res) => {
   try {
     const { setId, sectionName } = req.params;
@@ -934,6 +1243,153 @@ exports.addSubjectToSection = async (req, res) => {
 
     res.json(set);
 
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Edit a subject slot that is already in a section — its question limit, and
+// (while the slot is still empty) which subject it points at. This is the fix
+// for the common "typed 15 instead of 25" mistake, which previously needed the
+// whole set to be rebuilt.
+exports.updateSubjectInSection = async (req, res) => {
+  try {
+    const { setId, sectionName, subjectId } = req.params;
+    const { maxQuestions, subjectId: newSubjectId } = req.body;
+
+    const set = await SetPaper.findById(setId);
+    if (!set) return res.status(404).json({ message: "Set not found" });
+
+    if (blockIfPublished(set, res)) return;
+
+    const slot = resolveSlot(set, sectionName, subjectId, res);
+    if (!slot) return;
+
+    const { subject } = slot;
+    const currentCount = subject.questions.length;
+
+    if (maxQuestions !== undefined) {
+      const max = Number(maxQuestions);
+
+      if (!Number.isInteger(max) || max <= 0) {
+        return res.status(400).json({
+          message: "maxQuestions must be a whole number greater than 0"
+        });
+      }
+
+      // Lowering the limit below what is already added would leave the subject
+      // permanently over capacity and unable to publish.
+      if (max < currentCount) {
+        return res.status(400).json({
+          message: `This subject already has ${currentCount} question(s). Remove some before lowering the limit to ${max}.`
+        });
+      }
+
+      subject.maxQuestions = max;
+    }
+
+    if (newSubjectId !== undefined && newSubjectId !== subjectId) {
+      if (currentCount > 0) {
+        return res.status(400).json({
+          message: `Remove all ${currentCount} question(s) first — they belong to the current subject.`
+        });
+      }
+
+      const existsElsewhere = set.sections.some((sec) =>
+        sec.subjects.some((sub) => sub.subjectId.toString() === newSubjectId)
+      );
+      if (existsElsewhere) {
+        return res.status(400).json({
+          message: "Subject already assigned in another section of this set"
+        });
+      }
+
+      const valid = await Subject.exists({ _id: newSubjectId, isActive: true });
+      if (!valid) {
+        return res.status(400).json({ message: "Invalid or inactive subject" });
+      }
+
+      subject.subjectId = newSubjectId;
+    }
+
+    await set.save();
+    res.json(set);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Remove a subject slot from a section. Like deleteSection, the questions are
+// only unlinked from this set — they stay in the question bank.
+exports.removeSubjectFromSection = async (req, res) => {
+  try {
+    const { setId, sectionName, subjectId } = req.params;
+
+    const set = await SetPaper.findById(setId);
+    if (!set) return res.status(404).json({ message: "Set not found" });
+
+    if (blockIfPublished(set, res)) return;
+
+    const slot = resolveSlot(set, sectionName, subjectId, res);
+    if (!slot) return;
+
+    const { section } = slot;
+    section.subjects = section.subjects.filter(
+      (sub) => sub.subjectId.toString() !== subjectId
+    );
+
+    await set.save();
+    res.json({ message: "Subject removed successfully", set });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Move one section, subject or question up or down. Display order is just the
+// array order in the document, so a reorder is a splice — no extra field to
+// keep in sync. `from`/`to` are indexes in the list being reordered.
+exports.reorderSetItems = async (req, res) => {
+  try {
+    const { setId } = req.params;
+    const { type, sectionName, subjectId, from, to } = req.body;
+
+    const set = await SetPaper.findById(setId);
+    if (!set) return res.status(404).json({ message: "Set not found" });
+
+    if (blockIfPublished(set, res)) return;
+
+    let list;
+
+    if (type === "section") {
+      list = set.sections;
+    } else if (type === "subject" || type === "question") {
+      const index = findSectionIndex(set, sectionName);
+      if (index === -1) {
+        return res.status(404).json({ message: "Section not found" });
+      }
+
+      if (type === "subject") {
+        list = set.sections[index].subjects;
+      } else {
+        const slot = resolveSlot(set, sectionName, subjectId, res);
+        if (!slot) return;
+        list = slot.subject.questions;
+      }
+    } else {
+      return res.status(400).json({
+        message: 'type must be "section", "subject" or "question"'
+      });
+    }
+
+    if (!moveWithin(list, Number(from), Number(to))) {
+      return res.status(400).json({ message: "Invalid move position" });
+    }
+
+    // Mongoose does not always notice in-place splices on nested arrays.
+    set.markModified("sections");
+    await set.save();
+
+    res.json(set);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
