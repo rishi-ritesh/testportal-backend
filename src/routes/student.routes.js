@@ -109,4 +109,22 @@ router.get("/bookmarks", auth, student, getBookmarks);
 router.get("/bookmarks/ids", auth, student, getBookmarkIds);
 router.post("/bookmark/:questionId", auth, student, toggleBookmark);
 
+// Custom practice set (student-only, built from bookmarks, no marks)
+const custom = require("../controllers/customSet.controller");
+
+router.get("/custom-set", auth, student, custom.getCustomSet);
+router.post("/custom-set/questions", auth, student, custom.addQuestions);
+router.delete("/custom-set/questions/:questionId", auth, student, custom.removeQuestion);
+router.delete("/custom-set", auth, student, custom.clearSet);
+router.put("/custom-set/timer", auth, student, custom.updateTimer);
+
+router.post("/custom-set/start", auth, student, custom.startRun);
+router.get("/custom-set/attempt", auth, student, custom.getRunState);
+router.post("/custom-set/attempt/save-answer", auth, student, custom.saveRunAnswer);
+router.post("/custom-set/attempt/timer", auth, student, custom.syncRunTimer);
+router.post("/custom-set/attempt/pause", auth, student, custom.pauseRun);
+router.post("/custom-set/attempt/resume", auth, student, custom.resumeRun);
+router.post("/custom-set/attempt/submit", auth, student, custom.submitRun);
+router.get("/custom-set/result", auth, student, custom.getRunResult);
+
 module.exports = router;

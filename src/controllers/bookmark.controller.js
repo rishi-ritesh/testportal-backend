@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 
 const Bookmark = require("../models/Bookmark");
 const Question = require("../models/Question");
+const CustomSet = require("../models/CustomSet");
 
 // Toggle a bookmark on/off for the current user. Idempotent — safe to call
 // repeatedly; returns the resulting state.
@@ -24,6 +25,21 @@ exports.toggleBookmark = async (req, res) => {
     });
 
     if (existing) {
+      // Bookmark lock: a question that's in the student's custom practice set
+      // can't be unbookmarked until it's removed from the set.
+      const inSet = await CustomSet.exists({
+        userId: req.user.id,
+        questionIds: questionId
+      });
+      if (inSet) {
+        return res.status(409).json({
+          code: "IN_CUSTOM_SET",
+          bookmarked: true,
+          message:
+            "This question is in your custom practice set. Remove it from the set first."
+        });
+      }
+
       await Bookmark.deleteOne({ _id: existing._id });
       return res.json({ bookmarked: false });
     }
@@ -63,6 +79,9 @@ exports.getBookmarks = async (req, res) => {
         ]
       });
 
+    const customSet = await CustomSet.findOne({ userId: req.user.id }).select("questionIds");
+    const inSet = new Set((customSet?.questionIds || []).map(String));
+
     const data = rows
       .filter((r) => r.questionId && r.questionId.isActive)
       .map((r) => {
@@ -88,7 +107,8 @@ exports.getBookmarks = async (req, res) => {
             english: q.explanation?.en || "",
             hindi: q.explanation?.hi || ""
           },
-          bookmarkedAt: r.createdAt
+          bookmarkedAt: r.createdAt,
+          inCustomSet: inSet.has(String(q._id))
         };
       });
 
