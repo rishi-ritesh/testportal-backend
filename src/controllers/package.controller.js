@@ -2,6 +2,7 @@
 
 const Package = require("../models/Package");
 const SetPaper = require("../models/SetPaper");
+const { attemptStatusByTest, attemptSummary } = require("../utils/attemptStatus");
 
 // A published package is locked: no edits, no deletion, no changing its mocks.
 // Unpublish it first to make changes.
@@ -230,6 +231,12 @@ exports.getStudentPackageById = async (req, res) => {
     const mocks = (pkg.setPapers || [])
       .filter((s) => s && s.isPublished && s.isActive)
       .map(setSummary);
+
+    // this student's progress on each mock (read-only)
+    const progress = await attemptStatusByTest(req.user.id, mocks.map((m) => m.id));
+    mocks.forEach((m) => {
+      m.attempt = attemptSummary(progress, m.id);
+    });
 
     res.json({
       _id: pkg._id,

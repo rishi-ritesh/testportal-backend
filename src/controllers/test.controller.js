@@ -1,6 +1,7 @@
 // Backend/src/controllers/test.controller.js
 
 const SetPaper = require("../models/SetPaper");
+const { attemptStatusByTest, attemptSummary } = require("../utils/attemptStatus");
 
 exports.getPublishedTests = async (req, res) => {
   try {
@@ -28,6 +29,12 @@ exports.getPublishedTests = async (req, res) => {
         totalQuestions,
         totalDuration
       };
+    });
+
+    // this student's progress on each test (read-only)
+    const progress = await attemptStatusByTest(req.user.id, formatted.map((t) => t.id));
+    formatted.forEach((t) => {
+      t.attempt = attemptSummary(progress, t.id);
     });
 
     res.json(formatted);
