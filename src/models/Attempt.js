@@ -67,6 +67,15 @@ const AttemptSchema = new mongoose.Schema({
         default: 0
     },
 
+    // New attempts: the paper they were given is stored once in PaperCopy
+    // and referenced here. Old attempts keep their own embedded copy in
+    // testSnapshot (never migrated). Read either via utils/paperCopy paperOf().
+    paperCopyId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "PaperCopy",
+        default: null
+    },
+
     testSnapshot: {
         sections: [
             {

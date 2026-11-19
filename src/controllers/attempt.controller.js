@@ -5,6 +5,7 @@ const SetPaper = require("../models/SetPaper");
 const AttemptAnswer = require("../models/AttemptAnswer");
 const Question = require("../models/Question");
 const Package = require("../models/Package");
+const { storePaperCopy, paperOf, questionCounts } = require("../utils/paperCopy");
 
 // =========================
 // LIVE RANK HELPER
@@ -93,7 +94,7 @@ function fullSectionSeconds(setPaper, sectionName) {
   return min > 0 ? min * 60 : null;
 }
 
-function buildAttemptPayload(attempt) {
+function buildAttemptPayload(attempt, sections) {
   return {
     _id: attempt._id,
     attemptType: attempt.attemptType,
@@ -101,7 +102,7 @@ function buildAttemptPayload(attempt) {
     startedAt: attempt.startedAt,
     currentSectionIndex: attempt.currentSectionIndex,
     currentQuestionId: attempt.currentQuestionId,
-    sections: formatSnapshotSections(attempt.testSnapshot.sections)
+    sections: formatSnapshotSections(sections)
   };
 }
 
@@ -222,7 +223,16 @@ exports.startAttempt = async (req, res) => {
       return d > 0 ? d * 60 : null;
     })();
 
-    const createAttempt = (attemptType) =>
+    // the paper is stored once (or found, if this exact version is already
+    // stored) and new attempts point to it instead of embedding it
+    // (only when an attempt is actually created — not when resuming)
+    let paperCopyId = null;
+    const ensurePaperCopy = async () => {
+      if (!paperCopyId) paperCopyId = await storePaperCopy(test._id, snapshotSections);
+      return paperCopyId;
+    };
+
+    const createAttempt = async (attemptType) =>
       Attempt.create({
         userId: req.user.id,
         testId: test._id,
@@ -235,8 +245,11 @@ exports.startAttempt = async (req, res) => {
         currentSectionIndex: 0,
         currentQuestionId:
           snapshotSections[0]?.questions[0]?.questionId || null,
-        testSnapshot: { sections: snapshotSections }
+        paperCopyId: await ensurePaperCopy()
       });
+
+    const payload = async (attempt) =>
+      buildAttemptPayload(attempt, (await paperOf(attempt)).sections);
 
     const findAttempt = (attemptType) =>
       Attempt.findOne({
@@ -266,7 +279,7 @@ exports.startAttempt = async (req, res) => {
       const { attempt, created } = await createOrGetExisting("ranked");
       return res.status(created ? 201 : 200).json({
         message: created ? "Ranked attempt started" : "Resuming ranked attempt",
-        attempt: buildAttemptPayload(attempt)
+        attempt: await payload(attempt)
       });
     }
 
@@ -274,7 +287,7 @@ exports.startAttempt = async (req, res) => {
     if (rankedAttempt.status !== "completed") {
       return res.status(200).json({
         message: "Resuming ranked attempt",
-        attempt: buildAttemptPayload(rankedAttempt)
+        attempt: await payload(rankedAttempt)
       });
     }
 
@@ -285,7 +298,7 @@ exports.startAttempt = async (req, res) => {
     if (practiceAttempt && practiceAttempt.status !== "completed") {
       return res.status(200).json({
         message: "Resuming practice attempt",
-        attempt: buildAttemptPayload(practiceAttempt)
+        attempt: await payload(practiceAttempt)
       });
     }
 
@@ -313,7 +326,7 @@ exports.startAttempt = async (req, res) => {
 
     return res.status(created ? 201 : 200).json({
       message: created ? "Practice attempt started" : "Resuming practice attempt",
-      attempt: buildAttemptPayload(practice)
+      attempt: await payload(practice)
     });
 
   } catch (err) {
@@ -341,13 +354,16 @@ exports.getAttemptState = async (req, res) => {
       });
     }
 
+    // the paper this attempt was given (shared copy, or the old embedded one)
+    const paper = await paperOf(attempt);
+
     // ✅ section durations come from the live SetPaper config
     // (testSnapshot intentionally stores only question content).
     // Matched to snapshot sections by name so the client can run timers.
     const setPaper = await SetPaper.findById(attempt.testId);
 
     const sectionDurations =
-      (attempt.testSnapshot?.sections || []).map((section) => ({
+      paper.sections.map((section) => ({
         sectionId: section.sectionId,
         sectionName: section.sectionName,
         durationMinutes: sectionDurationMinutes(setPaper, section.sectionName)
@@ -357,7 +373,7 @@ exports.getAttemptState = async (req, res) => {
     // down and syncs it back, so a reload/resume continues from here (time only
     // passes while the student is actually on the test). Seed it the first time.
     const currentSection =
-      attempt.testSnapshot?.sections?.[attempt.currentSectionIndex];
+      paper.sections[attempt.currentSectionIndex];
 
     let currentSectionRemainingSeconds = attempt.sectionRemainingSeconds;
     if (currentSectionRemainingSeconds == null && currentSection) {
@@ -405,7 +421,7 @@ exports.getAttemptState = async (req, res) => {
       totalTimeSpent: attempt.totalTimeSpent,
 
       // ✅ everything the attempt screen needs to render & restore
-      testSnapshot: attempt.testSnapshot,
+      testSnapshot: { sections: paper.sections },
 
       submittedSections: attempt.submittedSections || [],
 
@@ -565,6 +581,9 @@ exports.saveAnswer = async (req, res) => {
       return res.status(409).json(OTHER_SESSION);
     }
 
+    // the paper this attempt was given (shared copy, or the old embedded one)
+    const paper = await paperOf(attempt);
+
     // ✅ verify question belongs to this attempt
     let questionSectionIndex = -1;
     let questionSnapshot = null;
@@ -572,10 +591,10 @@ exports.saveAnswer = async (req, res) => {
 
     for (
       let sectionIndex = 0;
-      sectionIndex < attempt.testSnapshot.sections.length;
+      sectionIndex < paper.sections.length;
       sectionIndex++
     ) {
-      const section = attempt.testSnapshot.sections[sectionIndex];
+      const section = paper.sections[sectionIndex];
 
       const found = section.questions.find(
         (q) =>
@@ -761,10 +780,10 @@ exports.saveAnswer = async (req, res) => {
 
       for (
         let sectionIndex = 0;
-        sectionIndex < attempt.testSnapshot.sections.length;
+        sectionIndex < paper.sections.length;
         sectionIndex++
       ) {
-        const section = attempt.testSnapshot.sections[sectionIndex];
+        const section = paper.sections[sectionIndex];
 
         const nextQuestion = section.questions.find(
           (q) => q.questionNumber === toQuestionNumber
@@ -793,7 +812,7 @@ exports.saveAnswer = async (req, res) => {
         // VISIT TRACKING (first visit → "skipped" row, created only once)
         // =========================
 
-        const nextSection = attempt.testSnapshot.sections[nextSectionIndex];
+        const nextSection = paper.sections[nextSectionIndex];
 
         const nextQuestionSnapshot = nextSection.questions.find(
           (q) => String(q.questionId) === String(nextQuestionId)
@@ -884,13 +903,16 @@ exports.submitSection = async (req, res) => {
       return res.status(409).json(OTHER_SESSION);
     }
 
+    // the paper this attempt was given (shared copy, or the old embedded one)
+    const paper = await paperOf(attempt);
+
     // current section
     const currentSectionIndex =
       attempt.currentSectionIndex;
 
     // total sections
     const totalSections =
-      attempt.testSnapshot.sections.length;
+      paper.sections.length;
 
     // ✅ already submitted check
     const alreadySubmitted =
@@ -1096,7 +1118,7 @@ exports.submitSection = async (req, res) => {
 
     // first question of next section
     const nextSection =
-      attempt.testSnapshot.sections[
+      paper.sections[
       attempt.currentSectionIndex
       ];
 
@@ -1272,6 +1294,9 @@ exports.getResult = async (req, res) => {
       });
     }
 
+    // the paper this attempt was given (shared copy, or the old embedded one)
+    const paper = await paperOf(attempt);
+
     // ✅ fetch answers
     const answers = await AttemptAnswer.find({
       attemptId,
@@ -1313,7 +1338,7 @@ exports.getResult = async (req, res) => {
     const allQuestionIds = [];
 
     for (
-      const section of attempt.testSnapshot.sections
+      const section of paper.sections
     ) {
       for (const q of section.questions) {
         allQuestionIds.push(q.questionId);
@@ -1371,7 +1396,7 @@ exports.getResult = async (req, res) => {
 
     for (
       const section of
-      attempt.testSnapshot.sections
+      paper.sections
     ) {
 
       for (
@@ -2173,12 +2198,17 @@ exports.getMyAttempts = async (req, res) => {
       .populate("testId", "title")
       .sort({ updatedAt: -1 });
 
+    // question counts for attempts that use a shared paper copy (one query)
+    const sharedCounts = await questionCounts(attempts.map((a) => a.paperCopyId));
+
     const data = await Promise.all(
       attempts.map(async (a) => {
 
-        // total questions straight from the snapshot (no extra query)
-        const totalQuestions =
-          (a.testSnapshot?.sections || []).reduce(
+        // total questions: shared copy → counted above; old attempts → their
+        // own embedded copy
+        const totalQuestions = a.paperCopyId
+          ? sharedCounts.get(String(a.paperCopyId)) || 0
+          : (a.testSnapshot?.sections || []).reduce(
             (sum, s) => sum + (s.questions?.length || 0),
             0
           );

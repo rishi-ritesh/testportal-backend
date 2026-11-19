@@ -20,6 +20,14 @@ const UNIQUE_INDEXES = [
     group: { u: "$userId", t: "$testId", k: "$attemptType" },
     what: "student/test pair(s) have more than one attempt of the same type",
     fix: "Resolve the extra attempts by hand (see the release notes)"
+  },
+  {
+    model: "PaperCopy",
+    label: "papercopies { testId, fingerprint } (unique)",
+    // one stored copy per test per content version
+    group: { t: "$testId", f: "$fingerprint" },
+    what: "paper version(s) are stored more than once",
+    fix: "Remove the extra copies that no attempt points to"
   }
 ];
 
