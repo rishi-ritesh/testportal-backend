@@ -50,6 +50,18 @@ const AttemptSchema = new mongoose.Schema({
         default: null
     },
 
+    // The test screen that currently owns this attempt (one open screen at a
+    // time). sessionSeenAt = its last heartbeat; null once the tab closed.
+    sessionId: {
+        type: String,
+        default: null
+    },
+
+    sessionSeenAt: {
+        type: Date,
+        default: null
+    },
+
     currentSectionIndex: {
         type: Number,
         default: 0

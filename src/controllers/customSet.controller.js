@@ -109,6 +109,22 @@ async function buildSetView(set) {
 }
 
 // Find the student's set with a run that is still going (in progress/paused).
+// ----- one open test screen per run (same rules as ranked/practice) -----
+const SESSION_LIVE_MS = 30 * 1000;
+const OTHER_SESSION = {
+  code: "OTHER_SESSION",
+  message: "This test was opened in another tab or device."
+};
+const isOtherSession = (storedId, sentId) =>
+  Boolean(sentId && storedId && String(sentId) !== String(storedId));
+
+// true when this request comes from a screen that has been replaced
+async function runSessionConflict(userId, sessionId) {
+  if (!sessionId) return false;
+  const set = await CustomSet.findOne({ userId }).select("run.sessionId");
+  return isOtherSession(set?.run?.sessionId, sessionId);
+}
+
 async function findActiveRun(userId) {
   const set = await CustomSet.findOne({ userId });
   if (!set || !set.run) return { set, error: [404, "No custom practice test found"] };
@@ -315,6 +331,40 @@ exports.startRun = async (req, res) => {
   }
 };
 
+// Register (or take over) the test screen for this run.
+// Body: { sessionId, takeover }
+exports.registerRunSession = async (req, res) => {
+  try {
+    const { sessionId, takeover } = req.body || {};
+    if (typeof sessionId !== "string" || !sessionId || sessionId.length > 100) {
+      return res.status(400).json({ message: "sessionId is required" });
+    }
+
+    const { set, error } = await findActiveRun(req.user.id);
+    if (error) return res.status(error[0]).json({ message: error[1] });
+
+    const run = set.run;
+    const otherIsLive =
+      isOtherSession(run.sessionId, sessionId) &&
+      run.sessionSeenAt &&
+      Date.now() - run.sessionSeenAt.getTime() < SESSION_LIVE_MS;
+
+    if (otherIsLive && !takeover) {
+      return res.status(409).json(OTHER_SESSION);
+    }
+
+    await CustomSet.updateOne(
+      { _id: set._id, "run.status": { $in: ["in_progress", "paused"] } },
+      { $set: { "run.sessionId": sessionId, "run.sessionSeenAt": new Date() } }
+    );
+
+    const maxSeq = run.answers.reduce((m, a) => Math.max(m, a.clientSeq || 0), 0);
+    res.json({ ok: true, maxSeq });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 // State for the test screen, in the same shape the ranked/practice attempt
 // screen already reads (one section, whole-set timer). Never includes the
 // correct answers.
@@ -369,13 +419,27 @@ exports.getRunState = async (req, res) => {
 // click and a navigation save can't overwrite each other's time.
 exports.saveRunAnswer = async (req, res) => {
   try {
-    const { questionId, selectedOption, markedForReview, timeSpent, toQuestionNumber } =
-      req.body || {};
+    const {
+      questionId,
+      selectedOption,
+      markedForReview,
+      timeSpent,
+      toQuestionNumber,
+      saveType,
+      seq,
+      sessionId
+    } = req.body || {};
+    // "timer" = time-only save (heartbeat / tab hidden): adds time only
+    const timeOnly = saveType === "timer";
+    const clientSeq = typeof seq === "number" && Number.isFinite(seq) ? seq : null;
 
     if (!isId(questionId)) return res.status(400).json({ message: "Invalid question id" });
 
     const { set, error } = await findActiveRun(req.user.id);
     if (error) return res.status(error[0]).json({ message: error[1] });
+    if (isOtherSession(set.run.sessionId, sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
+    }
 
     const run = set.run;
     const q = run.questions.find((x) => String(x.questionId) === String(questionId));
@@ -392,15 +456,18 @@ exports.saveRunAnswer = async (req, res) => {
       run.totalSeconds
     );
 
-    const $set = {
-      "run.answers.$[a].selectedOption": choice,
-      "run.answers.$[a].markedForReview": Boolean(markedForReview),
-      "run.answers.$[a].visited": true
-    };
+    const $set = timeOnly
+      ? { "run.answers.$[a].visited": true }
+      : {
+          "run.answers.$[a].selectedOption": choice,
+          "run.answers.$[a].markedForReview": Boolean(markedForReview),
+          "run.answers.$[a].visited": true
+        };
+    if (clientSeq != null) $set["run.answers.$[a].clientSeq"] = clientSeq;
     const arrayFilters = [{ "a.questionId": q.questionId }];
 
     // moving to another question → that one is now on screen (seen)
-    if (toQuestionNumber != null) {
+    if (toQuestionNumber != null && !timeOnly) {
       const target = run.questions.find((x) => x.questionNumber === Number(toQuestionNumber));
       if (target) {
         $set["run.currentQuestionId"] = target.questionId;
@@ -411,13 +478,29 @@ exports.saveRunAnswer = async (req, res) => {
       }
     }
 
+    const filter = { _id: set._id, "run.status": { $in: ["in_progress", "paused"] } };
+    if (clientSeq != null) {
+      // only a save newer than the one stored for this question applies
+      filter["run.answers"] = {
+        $elemMatch: {
+          questionId: q.questionId,
+          $or: [{ clientSeq: null }, { clientSeq: { $lt: clientSeq } }]
+        }
+      };
+    }
+
     const result = await CustomSet.updateOne(
-      { _id: set._id, "run.status": { $in: ["in_progress", "paused"] } },
+      filter,
       { $set, $inc: { "run.answers.$[a].timeSpent": seconds } },
       { arrayFilters }
     );
 
     if (!result.matchedCount) {
+      const now = await CustomSet.findOne({ _id: set._id }).select("run.status");
+      if (clientSeq != null && now?.run && now.run.status !== "submitted") {
+        // an older (or repeated) save — the stored one is newer, keep it
+        return res.json({ ok: true, ignored: true });
+      }
       return res.status(403).json({ message: "This custom practice test is already submitted" });
     }
 
@@ -439,11 +522,20 @@ function remainingUpdate(remainingSeconds) {
 exports.syncRunTimer = async (req, res) => {
   try {
     const $min = remainingUpdate(req.body?.remainingSeconds);
-    if (!$min) return res.status(400).json({ message: "remainingSeconds is required" });
+    const { sessionId, release } = req.body || {};
+    // a screen with a sessionId may send just a heartbeat / release
+    if (!$min && !sessionId) return res.status(400).json({ message: "remainingSeconds is required" });
+    if (await runSessionConflict(req.user.id, sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
+    }
+
+    const update = $min ? { $min } : {};
+    // heartbeat keeps this screen "live"; a closing tab (release) frees it
+    if (sessionId) update.$set = { "run.sessionSeenAt": release ? null : new Date() };
 
     await CustomSet.updateOne(
       { userId: req.user.id, "run.status": { $in: ["in_progress", "paused"] } },
-      { $min }
+      update
     );
     res.json({ ok: true });
   } catch (err) {
@@ -455,6 +547,9 @@ exports.pauseRun = async (req, res) => {
   try {
     const { set, error } = await findActiveRun(req.user.id);
     if (error) return res.status(error[0]).json({ message: error[1] });
+    if (isOtherSession(set.run.sessionId, req.body?.sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
+    }
 
     const update = { $set: { "run.status": "paused" } };
     if (set.run.status !== "paused") update.$set["run.pausedAt"] = new Date();
@@ -482,6 +577,10 @@ exports.pauseRun = async (req, res) => {
 
 exports.resumeRun = async (req, res) => {
   try {
+    if (await runSessionConflict(req.user.id, req.body?.sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
+    }
+
     const updated = await CustomSet.findOneAndUpdate(
       { userId: req.user.id, "run.status": { $in: ["in_progress", "paused"] } },
       { $set: { "run.status": "in_progress", "run.pausedAt": null } },
@@ -505,6 +604,10 @@ exports.resumeRun = async (req, res) => {
 // Body: { remainingSeconds }. Returns the shape the test screen expects.
 exports.submitRun = async (req, res) => {
   try {
+    if (await runSessionConflict(req.user.id, req.body?.sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
+    }
+
     const $min = remainingUpdate(req.body?.remainingSeconds);
     const update = {
       $set: { "run.status": "submitted", "run.submittedAt": new Date(), "run.pausedAt": null }

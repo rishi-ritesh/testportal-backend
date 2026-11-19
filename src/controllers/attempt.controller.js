@@ -401,7 +401,88 @@ exports.getAttemptState = async (req, res) => {
   }
 };
 
+// =========================
+// ONE OPEN TEST SCREEN PER ATTEMPT
+// =========================
+// The test screen registers a session id when it opens. Saves / timer syncs /
+// pause / resume / submit from an OLDER session id are rejected with 409
+// OTHER_SESSION, so a second tab or device can't silently overwrite answers.
+// A session counts as "live" while its heartbeat (every 10 s) is recent.
+// Requests without a sessionId (older app versions) are still accepted.
+const SESSION_LIVE_MS = 30 * 1000;
+
+const OTHER_SESSION = {
+  code: "OTHER_SESSION",
+  message: "This test was opened in another tab or device."
+};
+
+const isOtherSession = (storedId, sentId) =>
+  Boolean(sentId && storedId && String(sentId) !== String(storedId));
+
+// Register (or take over) the test screen for this attempt.
+// Body: { attemptId, sessionId, takeover }
+exports.registerSession = async (req, res) => {
+  try {
+    const { attemptId, sessionId, takeover } = req.body || {};
+
+    if (!attemptId || typeof sessionId !== "string" || !sessionId || sessionId.length > 100) {
+      return res.status(400).json({ message: "attemptId and sessionId are required" });
+    }
+
+    const attempt = await Attempt.findOne({ _id: attemptId, userId: req.user.id })
+      .select("status sessionId sessionSeenAt");
+
+    if (!attempt) {
+      return res.status(404).json({ message: "Attempt not found" });
+    }
+
+    if (attempt.status === "completed") {
+      return res.json({ ok: true, completed: true, maxSeq: 0 });
+    }
+
+    const otherIsLive =
+      isOtherSession(attempt.sessionId, sessionId) &&
+      attempt.sessionSeenAt &&
+      Date.now() - attempt.sessionSeenAt.getTime() < SESSION_LIVE_MS;
+
+    if (otherIsLive && !takeover) {
+      return res.status(409).json(OTHER_SESSION);
+    }
+
+    await Attempt.updateOne(
+      { _id: attempt._id },
+      { $set: { sessionId, sessionSeenAt: new Date() } }
+    );
+
+    // highest save sequence already stored, so this screen's new saves are
+    // always numbered after it (even if this device's clock is behind)
+    const last = await AttemptAnswer.findOne({
+      attemptId: attempt._id,
+      userId: req.user.id,
+      clientSeq: { $ne: null }
+    })
+      .sort({ clientSeq: -1 })
+      .select("clientSeq");
+
+    res.json({ ok: true, maxSeq: last?.clientSeq || 0 });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 // Attempt Answer
+//
+// One atomic upsert per save (no read-then-save), so two quick saves for the
+// same question can't overwrite each other and two simultaneous first saves
+// can't create two rows (unique index on attemptId + questionId + userId).
+//
+// Optional `seq` (client sequence number, increasing per attempt): a save
+// whose seq is not newer than the one already stored for that question is
+// ignored — answer AND time — so a slow old save can't overwrite a newer
+// answer and a retried save is never counted twice.
+//
+// saveType "timer" = time-only save (heartbeat / tab hidden): adds timeSpent
+// without touching the chosen option or the review mark.
 exports.saveAnswer = async (req, res) => {
   try {
 
@@ -409,19 +490,15 @@ exports.saveAnswer = async (req, res) => {
       attemptId,
       questionId,
       questionNumber,
-
       selectedOption,
-
       answerStatus,
-
       markedForReview,
-
       timeSpent,
-
       fromQuestionNumber,
       toQuestionNumber,
-
-      saveType
+      saveType,
+      seq,
+      sessionId
     } = req.body;
 
     // ✅ validation
@@ -434,6 +511,11 @@ exports.saveAnswer = async (req, res) => {
         message: "Missing required fields"
       });
     }
+
+    const clientSeq =
+      typeof seq === "number" && Number.isFinite(seq) ? seq : null;
+
+    const timeOnly = saveType === "timer";
 
     // ✅ verify attempt ownership
     const attempt = await Attempt.findOne({
@@ -454,13 +536,14 @@ exports.saveAnswer = async (req, res) => {
       });
     }
 
+    // ✅ only the screen that currently owns the attempt may save
+    if (isOtherSession(attempt.sessionId, sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
+    }
+
     // ✅ verify question belongs to this attempt
-    let questionExists = false;
-
     let questionSectionIndex = -1;
-
     let questionSnapshot = null;
-
     let sectionSnapshot = null;
 
     for (
@@ -468,9 +551,7 @@ exports.saveAnswer = async (req, res) => {
       sectionIndex < attempt.testSnapshot.sections.length;
       sectionIndex++
     ) {
-
-      const section =
-        attempt.testSnapshot.sections[sectionIndex];
+      const section = attempt.testSnapshot.sections[sectionIndex];
 
       const found = section.questions.find(
         (q) =>
@@ -479,20 +560,14 @@ exports.saveAnswer = async (req, res) => {
       );
 
       if (found) {
-
-        questionExists = true;
-
         questionSectionIndex = sectionIndex;
-
         questionSnapshot = found;
-
         sectionSnapshot = section;
-
         break;
       }
     }
 
-    if (!questionExists) {
+    if (!questionSnapshot) {
       return res.status(400).json({
         message: "Question does not belong to this attempt"
       });
@@ -507,17 +582,11 @@ exports.saveAnswer = async (req, res) => {
       });
     }
 
-    // ✅ find section marking scheme
-    const sectionData =
-      attempt.testSnapshot.sections[questionSectionIndex];
-
     // find actual section config from SetPaper
-    const setPaper = await SetPaper.findById(
-      attempt.testId
-    );
+    const setPaper = await SetPaper.findById(attempt.testId);
 
     const actualSection = setPaper.sections.find(
-      (s) => s.name === sectionData.sectionName
+      (s) => s.name === sectionSnapshot.sectionName
     );
 
     if (!actualSection) {
@@ -526,20 +595,16 @@ exports.saveAnswer = async (req, res) => {
       });
     }
 
-    // ✅ evaluate answer
+    // ✅ evaluate answer (unchanged scoring)
     // Score whenever an option is selected — independent of the
     // "mark for review" flag, so answered+marked still counts.
     const correctAnswer = question.correctAnswer;
 
     let isCorrect = false;
-
     let marksAwarded = 0;
 
     if (selectedOption) {
-
-      isCorrect =
-        selectedOption === correctAnswer;
-
+      isCorrect = selectedOption === correctAnswer;
       marksAwarded = isCorrect
         ? actualSection.positiveMarks
         : -actualSection.negativeMarks;
@@ -548,10 +613,9 @@ exports.saveAnswer = async (req, res) => {
     const isMarked = Boolean(markedForReview);
 
     // ✅ prevent editing submitted section
-    const lockedSection =
-      (attempt.submittedSections || []).find(
-        (s) => s.sectionIndex === questionSectionIndex
-      );
+    const lockedSection = (attempt.submittedSections || []).find(
+      (s) => s.sectionIndex === questionSectionIndex
+    );
 
     if (lockedSection) {
       return res.status(403).json({
@@ -560,13 +624,108 @@ exports.saveAnswer = async (req, res) => {
     }
 
     // =========================
-    // UPDATE CURRENT POSITION
+    // SAVE THE ANSWER (single atomic upsert)
     // =========================
 
-    if (toQuestionNumber) {
+    const seconds = Math.max(0, Math.floor(Number(timeSpent) || 0));
 
+    const filter = { attemptId, questionId, userId: req.user.id };
+    if (clientSeq != null) {
+      // only newer saves apply (null also matches rows without a seq yet)
+      filter.$or = [{ clientSeq: null }, { clientSeq: { $lt: clientSeq } }];
+    }
+
+    const identity = {
+      questionNumber,
+      sectionId: sectionSnapshot.sectionId,
+      sectionName: sectionSnapshot.sectionName,
+      subjectId: questionSnapshot.subjectId,
+      subjectName: questionSnapshot.subjectName,
+      topicId: questionSnapshot.topicId,
+      topicName: questionSnapshot.topicName
+    };
+
+    const answerFields = timeOnly
+      ? null
+      : {
+          selectedOption: selectedOption ?? null,
+          answerStatus,
+          markedForReview: isMarked,
+          fromQuestionNumber,
+          toQuestionNumber,
+          saveType,
+          correctAnswer,
+          isCorrect,
+          marksAwarded
+        };
+
+    const update = {
+      $inc: { timeSpent: seconds },
+      $set: { ...(answerFields || {}) },
+      $setOnInsert: { ...identity }
+    };
+    if (clientSeq != null) update.$set.clientSeq = clientSeq;
+
+    if (timeOnly) {
+      // a time-only save on a question with no row yet = visited, not answered
+      Object.assign(update.$setOnInsert, {
+        selectedOption: null,
+        answerStatus: "skipped",
+        markedForReview: false,
+        saveType,
+        correctAnswer,
+        isCorrect: false,
+        marksAwarded: 0
+      });
+    }
+
+    if (!Object.keys(update.$set).length) delete update.$set;
+
+    const upsert = () =>
+      AttemptAnswer.findOneAndUpdate(filter, update, {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+        runValidators: true
+      });
+
+    let answer = null;
+    let ignored = false;
+
+    try {
+      answer = await upsert();
+    } catch (err) {
+      if (err.code !== 11000) throw err;
+      // Either a simultaneous first save created the row a moment ago (retry
+      // applies normally), or the stored save is newer than this one.
+      try {
+        answer = await upsert();
+      } catch (err2) {
+        if (err2.code !== 11000) throw err2;
+        ignored = true;
+      }
+    }
+
+    if (ignored) {
+      const current = await AttemptAnswer.findOne({
+        attemptId,
+        questionId,
+        userId: req.user.id
+      });
+
+      return res.json({
+        message: "Older save ignored",
+        ignored: true,
+        answer: current ? publicAnswer(current) : null
+      });
+    }
+
+    // =========================
+    // UPDATE CURRENT POSITION (only for a save that applied)
+    // =========================
+
+    if (toQuestionNumber && !timeOnly) {
       let nextQuestionId = null;
-
       let nextSectionIndex = 0;
 
       for (
@@ -574,217 +733,78 @@ exports.saveAnswer = async (req, res) => {
         sectionIndex < attempt.testSnapshot.sections.length;
         sectionIndex++
       ) {
-
-        const section =
-          attempt.testSnapshot.sections[sectionIndex];
+        const section = attempt.testSnapshot.sections[sectionIndex];
 
         const nextQuestion = section.questions.find(
           (q) => q.questionNumber === toQuestionNumber
         );
 
         if (nextQuestion) {
-
           nextQuestionId = nextQuestion.questionId;
-
           nextSectionIndex = sectionIndex;
-
           break;
         }
       }
 
       // ✅ update attempt position
       if (nextQuestionId) {
-
-        attempt.currentQuestionId = nextQuestionId;
-
-        attempt.currentSectionIndex = nextSectionIndex;
-
-        await attempt.save();
+        await Attempt.updateOne(
+          { _id: attempt._id },
+          {
+            $set: {
+              currentQuestionId: nextQuestionId,
+              currentSectionIndex: nextSectionIndex
+            }
+          }
+        );
 
         // =========================
-        // VISIT TRACKING
+        // VISIT TRACKING (first visit → "skipped" row, created only once)
         // =========================
 
-        const existingVisitedAnswer =
-          await AttemptAnswer.findOne({
+        const nextSection = attempt.testSnapshot.sections[nextSectionIndex];
 
-            attemptId,
+        const nextQuestionSnapshot = nextSection.questions.find(
+          (q) => String(q.questionId) === String(nextQuestionId)
+        );
 
-            questionId: nextQuestionId,
+        const nextQuestion = await Question.findById(nextQuestionId);
 
-            userId: req.user.id
-          });
-
-        // ✅ first time visited
-        if (!existingVisitedAnswer) {
-
-          const nextSection =
-            attempt.testSnapshot.sections[
-            nextSectionIndex
-            ];
-
-          const nextQuestionSnapshot =
-            nextSection.questions.find(
-              (q) =>
-                String(q.questionId) ===
-                String(nextQuestionId)
+        if (nextQuestionSnapshot && nextQuestion) {
+          try {
+            await AttemptAnswer.updateOne(
+              { attemptId, questionId: nextQuestionId, userId: req.user.id },
+              {
+                $setOnInsert: {
+                  questionNumber: nextQuestionSnapshot.questionNumber,
+                  sectionId: nextSection.sectionId,
+                  sectionName: nextSection.sectionName,
+                  subjectId: nextQuestionSnapshot.subjectId,
+                  subjectName: nextQuestionSnapshot.subjectName,
+                  topicId: nextQuestionSnapshot.topicId,
+                  topicName: nextQuestionSnapshot.topicName,
+                  selectedOption: null,
+                  answerStatus: "skipped",
+                  fromQuestionNumber,
+                  toQuestionNumber,
+                  saveType,
+                  correctAnswer: nextQuestion.correctAnswer,
+                  isCorrect: false,
+                  marksAwarded: 0,
+                  timeSpent: 0
+                }
+              },
+              { upsert: true, setDefaultsOnInsert: true }
             );
-
-          // fetch actual next question
-          const nextQuestion =
-            await Question.findById(
-              nextQuestionId
-            );
-
-          if (
-            nextQuestionSnapshot &&
-            nextQuestion
-          ) {
-
-            await AttemptAnswer.create({
-
-              attemptId,
-
-              userId: req.user.id,
-
-              questionId:
-                nextQuestionId,
-
-              questionNumber:
-                nextQuestionSnapshot.questionNumber,
-
-              sectionId:
-                nextSection.sectionId,
-
-              sectionName:
-                nextSection.sectionName,
-
-              subjectId:
-                nextQuestionSnapshot.subjectId,
-
-              subjectName:
-                nextQuestionSnapshot.subjectName,
-
-              topicId:
-                nextQuestionSnapshot.topicId,
-
-              topicName:
-                nextQuestionSnapshot.topicName,
-
-              selectedOption: null,
-
-              answerStatus: "skipped",
-
-              fromQuestionNumber,
-
-              toQuestionNumber,
-
-              saveType,
-
-              correctAnswer:
-                nextQuestion.correctAnswer,
-
-              isCorrect: false,
-
-              marksAwarded: 0,
-
-              timeSpent: 0
-            });
+          } catch (err) {
+            // the row was created at the same moment by another save — fine
+            if (err.code !== 11000) throw err;
           }
         }
       }
     }
 
-    // ✅ check existing answer
-    let answer = await AttemptAnswer.findOne({
-      attemptId,
-      questionId,
-      userId: req.user.id
-    });
-
-    // =========================
-    // UPDATE EXISTING ANSWER
-    // =========================
-
-    if (answer) {
-
-      answer.selectedOption = selectedOption;
-
-      answer.answerStatus = answerStatus;
-
-      answer.markedForReview = isMarked;
-
-      answer.fromQuestionNumber = fromQuestionNumber;
-
-      answer.toQuestionNumber = toQuestionNumber;
-
-      answer.saveType = saveType;
-
-      answer.correctAnswer = correctAnswer;
-
-      answer.isCorrect = isCorrect;
-
-      answer.marksAwarded = marksAwarded;
-
-      // accumulate time
-      answer.timeSpent += Number(timeSpent || 0);
-
-      await answer.save();
-
-      return res.json({
-        message: "Answer updated",
-        answer: publicAnswer(answer)
-      });
-    }
-
-    // =========================
-    // CREATE NEW ANSWER
-    // =========================
-
-    answer = await AttemptAnswer.create({
-
-      attemptId,
-
-      userId: req.user.id,
-
-      questionId,
-
-      questionNumber,
-
-      sectionId: sectionSnapshot.sectionId,
-
-      sectionName: sectionSnapshot.sectionName,
-
-      subjectId: questionSnapshot.subjectId,
-
-      subjectName: questionSnapshot.subjectName,
-
-      topicId: questionSnapshot.topicId,
-
-      topicName: questionSnapshot.topicName,
-
-      selectedOption,
-
-      answerStatus,
-
-      markedForReview: isMarked,
-
-      fromQuestionNumber,
-
-      toQuestionNumber,
-
-      saveType,
-
-      correctAnswer,
-
-      isCorrect,
-
-      marksAwarded,
-
-      timeSpent: Number(timeSpent || 0)
-    });
-
-    res.status(201).json({
+    res.json({
       message: "Answer saved",
       answer: publicAnswer(answer)
     });
@@ -826,6 +846,11 @@ exports.submitSection = async (req, res) => {
       return res.status(403).json({
         message: "Attempt already completed"
       });
+    }
+
+    // ✅ only the screen that currently owns the attempt may do this
+    if (isOtherSession(attempt.sessionId, req.body.sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
     }
 
     // current section
@@ -1082,8 +1107,10 @@ function clampRemaining(stored, reported) {
 // simply "save where the countdown is now".
 exports.syncTimer = async (req, res) => {
   try {
-    const { attemptId, remainingSeconds } = req.body;
-    if (!attemptId || typeof remainingSeconds !== "number") {
+    const { attemptId, remainingSeconds, sessionId, release } = req.body;
+    const hasTime = typeof remainingSeconds === "number";
+    // a screen with a sessionId may send just a heartbeat / release (untimed section)
+    if (!attemptId || (!hasTime && !sessionId)) {
       return res.status(400).json({ message: "attemptId and remainingSeconds are required" });
     }
 
@@ -1094,11 +1121,20 @@ exports.syncTimer = async (req, res) => {
     if (attempt.status === "completed") {
       return res.json({ ok: true }); // ignore late syncs
     }
+    if (isOtherSession(attempt.sessionId, sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
+    }
 
-    attempt.sectionRemainingSeconds = clampRemaining(
-      attempt.sectionRemainingSeconds,
-      remainingSeconds
-    );
+    if (hasTime) {
+      attempt.sectionRemainingSeconds = clampRemaining(
+        attempt.sectionRemainingSeconds,
+        remainingSeconds
+      );
+    }
+    // heartbeat keeps this screen "live"; a closing tab (release) frees it
+    if (sessionId && attempt.sessionId === sessionId) {
+      attempt.sessionSeenAt = release ? null : new Date();
+    }
     await attempt.save();
 
     res.json({ ok: true });
@@ -1122,6 +1158,9 @@ exports.pauseAttempt = async (req, res) => {
     }
     if (attempt.status === "completed") {
       return res.status(403).json({ message: "Attempt already completed" });
+    }
+    if (isOtherSession(attempt.sessionId, req.body.sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
     }
 
     if (typeof remainingSeconds === "number") {
@@ -1163,6 +1202,9 @@ exports.resumeAttempt = async (req, res) => {
     }
     if (attempt.status === "completed") {
       return res.status(403).json({ message: "Attempt already completed" });
+    }
+    if (isOtherSession(attempt.sessionId, req.body.sessionId)) {
+      return res.status(409).json(OTHER_SESSION);
     }
 
     if (attempt.status === "paused") {

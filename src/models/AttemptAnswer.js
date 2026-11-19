@@ -100,8 +100,17 @@ const AttemptAnswerSchema = new mongoose.Schema({
             "save_and_next",
             "direct_navigation",
             "mark_for_review",
-            "clear_response"
+            "clear_response",
+            "answer_select", // option tapped (saved straight away)
+            "timer" // time-only save (heartbeat / tab hidden)
         ]
+    },
+
+    // Sequence number of the last save applied from the test screen; older
+    // or repeated saves for this question are ignored.
+    clientSeq: {
+        type: Number,
+        default: null
     },
 
     // Evaluation
@@ -127,6 +136,13 @@ const AttemptAnswerSchema = new mongoose.Schema({
     }
 
 }, { timestamps: true });
+
+// One row per question per attempt — two simultaneous first saves can't
+// create duplicates.
+AttemptAnswerSchema.index(
+    { attemptId: 1, questionId: 1, userId: 1 },
+    { unique: true }
+);
 
 module.exports = mongoose.model(
     "AttemptAnswer",

@@ -58,7 +58,9 @@ const runAnswerSchema = new mongoose.Schema(
     selectedOption: { type: String, default: null },
     markedForReview: { type: Boolean, default: false },
     timeSpent: { type: Number, default: 0 }, // seconds, summed across visits
-    visited: { type: Boolean, default: false }
+    visited: { type: Boolean, default: false },
+    // sequence number of the last applied save; older/repeated saves are ignored
+    clientSeq: { type: Number, default: null }
   },
   { _id: false }
 );
@@ -78,6 +80,9 @@ const runSchema = new mongoose.Schema(
     submittedAt: { type: Date, default: null },
     autoSubmitted: { type: Boolean, default: false },
     currentQuestionId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    // the test screen that currently owns this run (see attempt sessions)
+    sessionId: { type: String, default: null },
+    sessionSeenAt: { type: Date, default: null },
     questions: [runQuestionSchema],
     answers: [runAnswerSchema]
   },

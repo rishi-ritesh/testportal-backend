@@ -15,6 +15,7 @@ const {
   pauseAttempt,
   resumeAttempt,
   syncTimer,
+  registerSession,
   getResult,
   getMyAttempts,
   getNextAttemptInfo
@@ -96,6 +97,9 @@ router.post("/attempt/resume", auth, student, resumeAttempt);
 // Persist the section timer (heartbeat / tab close)
 router.post("/attempt/timer", auth, student, syncTimer);
 
+// One open test screen per attempt (register / take over)
+router.post("/attempt/session", auth, student, registerSession);
+
 // Get Result
 router.get(
   "/result/:attemptId",
@@ -120,6 +124,7 @@ router.put("/custom-set/timer", auth, student, custom.updateTimer);
 
 router.post("/custom-set/start", auth, student, custom.startRun);
 router.get("/custom-set/attempt", auth, student, custom.getRunState);
+router.post("/custom-set/attempt/session", auth, student, custom.registerRunSession);
 router.post("/custom-set/attempt/save-answer", auth, student, custom.saveRunAnswer);
 router.post("/custom-set/attempt/timer", auth, student, custom.syncRunTimer);
 router.post("/custom-set/attempt/pause", auth, student, custom.pauseRun);
