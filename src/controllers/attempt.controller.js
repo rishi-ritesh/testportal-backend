@@ -238,18 +238,35 @@ exports.startAttempt = async (req, res) => {
         testSnapshot: { sections: snapshotSections }
       });
 
-    const rankedAttempt = await Attempt.findOne({
-      userId: req.user.id,
-      testId: test._id,
-      attemptType: "ranked"
-    });
+    const findAttempt = (attemptType) =>
+      Attempt.findOne({
+        userId: req.user.id,
+        testId: test._id,
+        attemptType
+      });
+
+    // Create the attempt. If another request created the same one at the
+    // same moment (unique index → duplicate key), use that one instead:
+    // the student simply resumes it, no error.
+    const createOrGetExisting = async (attemptType) => {
+      try {
+        return { attempt: await createAttempt(attemptType), created: true };
+      } catch (err) {
+        if (err.code !== 11000) throw err;
+        const existing = await findAttempt(attemptType);
+        if (!existing) throw err;
+        return { attempt: existing, created: false };
+      }
+    };
+
+    const rankedAttempt = await findAttempt("ranked");
 
     // 1) No ranked attempt yet → this first attempt becomes the ranked one
     if (!rankedAttempt) {
-      const created = await createAttempt("ranked");
-      return res.status(201).json({
-        message: "Ranked attempt started",
-        attempt: buildAttemptPayload(created)
+      const { attempt, created } = await createOrGetExisting("ranked");
+      return res.status(created ? 201 : 200).json({
+        message: created ? "Ranked attempt started" : "Resuming ranked attempt",
+        attempt: buildAttemptPayload(attempt)
       });
     }
 
@@ -262,11 +279,7 @@ exports.startAttempt = async (req, res) => {
     }
 
     // 3) Ranked attempt is done → everything beyond is PRACTICE
-    const practiceAttempt = await Attempt.findOne({
-      userId: req.user.id,
-      testId: test._id,
-      attemptType: "practice"
-    });
+    const practiceAttempt = await findAttempt("practice");
 
     //    a) practice in progress → resume it
     if (practiceAttempt && practiceAttempt.status !== "completed") {
@@ -276,19 +289,30 @@ exports.startAttempt = async (req, res) => {
       });
     }
 
-    //    b) previous practice completed → overwrite it (answers + doc)
+    //    b) previous practice completed → overwrite it (doc + answers).
+    //       The delete only matches a COMPLETED PRACTICE attempt, so it can
+    //       never remove the ranked attempt or a practice run in progress.
+    //       If two re-attempts race, only one of them deletes it.
     if (practiceAttempt) {
-      await AttemptAnswer.deleteMany({
-        attemptId: practiceAttempt._id
+      const removed = await Attempt.deleteOne({
+        _id: practiceAttempt._id,
+        userId: req.user.id,
+        attemptType: "practice",
+        status: "completed"
       });
-      await Attempt.deleteOne({ _id: practiceAttempt._id });
+      if (removed.deletedCount === 1) {
+        await AttemptAnswer.deleteMany({
+          attemptId: practiceAttempt._id
+        });
+      }
     }
 
-    //    c) start a fresh practice attempt
-    const practice = await createAttempt("practice");
+    //    c) start a fresh practice attempt (or resume the one another
+    //       request created at the same moment)
+    const { attempt: practice, created } = await createOrGetExisting("practice");
 
-    return res.status(201).json({
-      message: "Practice attempt started",
+    return res.status(created ? 201 : 200).json({
+      message: created ? "Practice attempt started" : "Resuming practice attempt",
       attempt: buildAttemptPayload(practice)
     });
 

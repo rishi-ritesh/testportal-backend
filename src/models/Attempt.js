@@ -167,4 +167,11 @@ const AttemptSchema = new mongoose.Schema({
 
 }, { timestamps: true });
 
+// At most one ranked and one practice attempt per student per test — two
+// Start taps at the same moment (two tabs / devices) can't create two.
+AttemptSchema.index(
+    { userId: 1, testId: 1, attemptType: 1 },
+    { unique: true }
+);
+
 module.exports = mongoose.model("Attempt", AttemptSchema);

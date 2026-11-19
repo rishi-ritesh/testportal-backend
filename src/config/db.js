@@ -1,37 +1,49 @@
 const mongoose = require("mongoose");
 
-// The unique index on answers (one row per question per attempt). Mongoose
-// builds it when the app starts; this waits for that and says clearly in the
-// log whether it worked. A failure (e.g. duplicate rows already in the
-// database) never stops the server — answer saves still work without it.
-const ANSWER_INDEX = "attemptanswers { attemptId, questionId, userId } (unique)";
+// Unique indexes the app relies on. Mongoose builds them when the app starts;
+// this waits for that and says clearly in the log whether each one worked.
+// A failure (e.g. duplicate documents already in the database) never stops
+// the server — the app still works without the index.
+const UNIQUE_INDEXES = [
+  {
+    model: "AttemptAnswer",
+    label: "attemptanswers { attemptId, questionId, userId } (unique)",
+    // one answer row per question per attempt
+    group: { a: "$attemptId", q: "$questionId", u: "$userId" },
+    what: "question(s) have more than one answer row",
+    fix: "Remove the extra rows"
+  },
+  {
+    model: "Attempt",
+    label: "attempts { userId, testId, attemptType } (unique)",
+    // one ranked and one practice attempt per student per test
+    group: { u: "$userId", t: "$testId", k: "$attemptType" },
+    what: "student/test pair(s) have more than one attempt of the same type",
+    fix: "Resolve the extra attempts by hand (see the release notes)"
+  }
+];
 
-async function checkAnswerIndex() {
-  const AttemptAnswer = require("../models/AttemptAnswer");
+async function checkUniqueIndex({ model, label, group, what, fix }) {
+  const Model = require(`../models/${model}`);
   try {
-    await AttemptAnswer.init();
-    console.log(`Index ready: ${ANSWER_INDEX}`);
+    await Model.init();
+    console.log(`Index ready: ${label}`);
   } catch (err) {
-    console.error(`INDEX ERROR: could not create ${ANSWER_INDEX}: ${err.message}`);
+    console.error(`INDEX ERROR: could not create ${label}: ${err.message}`);
     try {
-      const [dup] = await AttemptAnswer.aggregate([
-        {
-          $group: {
-            _id: { a: "$attemptId", q: "$questionId", u: "$userId" },
-            n: { $sum: 1 }
-          }
-        },
+      const [dup] = await Model.aggregate([
+        { $group: { _id: group, n: { $sum: 1 } } },
         { $match: { n: { $gt: 1 } } },
-        { $count: "questions" }
+        { $count: "found" }
       ]);
       console.error(
-        `INDEX ERROR: ${dup?.questions || 0} question(s) have more than one answer row. ` +
-        "Remove the extra rows, then restart the server to build the index."
+        `INDEX ERROR: ${dup?.found || 0} ${what}. ` +
+        `${fix}, then restart the server to build the index.`
       );
     } catch {
       /* the count is only extra help */
     }
-    console.error("INDEX ERROR: the server keeps running; answer saves still work without this index.");
+    console.error("INDEX ERROR: the server keeps running without this index.");
   }
 }
 
@@ -44,7 +56,9 @@ const connectDB = async () => {
     process.exit(1);
   }
 
-  await checkAnswerIndex();
+  for (const index of UNIQUE_INDEXES) {
+    await checkUniqueIndex(index);
+  }
 };
 
 module.exports = connectDB;
