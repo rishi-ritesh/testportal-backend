@@ -681,28 +681,35 @@ exports.saveAnswer = async (req, res) => {
 
     if (!Object.keys(update.$set).length) delete update.$set;
 
-    const upsert = () =>
-      AttemptAnswer.findOneAndUpdate(filter, update, {
-        upsert: true,
-        new: true,
-        setDefaultsOnInsert: true,
-        runValidators: true
-      });
+    const identityFilter = { attemptId, questionId, userId: req.user.id };
+    const options = { new: true, setDefaultsOnInsert: true, runValidators: true };
 
-    let answer = null;
+    // 1) update the existing row (only if this save is newer)
+    const updateExisting = () =>
+      AttemptAnswer.findOneAndUpdate(filter, update, options);
+
+    let answer = await updateExisting();
     let ignored = false;
 
-    try {
-      answer = await upsert();
-    } catch (err) {
-      if (err.code !== 11000) throw err;
-      // Either a simultaneous first save created the row a moment ago (retry
-      // applies normally), or the stored save is newer than this one.
-      try {
-        answer = await upsert();
-      } catch (err2) {
-        if (err2.code !== 11000) throw err2;
+    if (!answer) {
+      if (await AttemptAnswer.exists(identityFilter)) {
+        // 2) the row exists but holds a newer (or the same) save → ignore this one
         ignored = true;
+      } else {
+        // 3) first save for this question → create the row. Never relies on
+        //    the unique index to detect an older save, so it is correct even
+        //    if that index could not be built.
+        try {
+          answer = await AttemptAnswer.findOneAndUpdate(filter, update, {
+            ...options,
+            upsert: true
+          });
+        } catch (err) {
+          if (err.code !== 11000) throw err;
+          // another save created the row a moment ago → apply on top of it
+          answer = await updateExisting();
+          if (!answer) ignored = true;
+        }
       }
     }
 
