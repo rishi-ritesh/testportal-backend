@@ -1184,11 +1184,26 @@ exports.syncTimer = async (req, res) => {
         remainingSeconds
       );
     }
-    // heartbeat keeps this screen "live"; a closing tab (release) frees it
-    if (sessionId && attempt.sessionId === sessionId) {
-      attempt.sessionSeenAt = release ? null : new Date();
-    }
     await attempt.save();
+
+    // heartbeat keeps this screen "live"; a closing tab / Save & Exit
+    // (release) frees it. Separate single updates, so a heartbeat that was
+    // already on its way when the student exited can never undo the release:
+    // a heartbeat only counts while the test is not paused (Save & Exit
+    // pauses first).
+    if (sessionId && attempt.sessionId === sessionId) {
+      if (release) {
+        await Attempt.updateOne(
+          { _id: attempt._id, sessionId },
+          { $set: { sessionSeenAt: null } }
+        );
+      } else {
+        await Attempt.updateOne(
+          { _id: attempt._id, sessionId, status: { $ne: "paused" } },
+          { $set: { sessionSeenAt: new Date() } }
+        );
+      }
+    }
 
     res.json({ ok: true });
   } catch (err) {

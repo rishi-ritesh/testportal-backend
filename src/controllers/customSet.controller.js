@@ -529,14 +529,25 @@ exports.syncRunTimer = async (req, res) => {
       return res.status(409).json(OTHER_SESSION);
     }
 
-    const update = $min ? { $min } : {};
-    // heartbeat keeps this screen "live"; a closing tab (release) frees it
-    if (sessionId) update.$set = { "run.sessionSeenAt": release ? null : new Date() };
+    if ($min) {
+      await CustomSet.updateOne(
+        { userId: req.user.id, "run.status": { $in: ["in_progress", "paused"] } },
+        { $min }
+      );
+    }
 
-    await CustomSet.updateOne(
-      { userId: req.user.id, "run.status": { $in: ["in_progress", "paused"] } },
-      update
-    );
+    // heartbeat keeps this screen "live"; a closing tab / Save & Exit
+    // (release) frees it. A heartbeat only counts while the run is not
+    // paused, so one still on its way when the student exited can't undo
+    // the release (Save & Exit pauses first).
+    if (sessionId) {
+      await CustomSet.updateOne(
+        release
+          ? { userId: req.user.id, "run.sessionId": sessionId, "run.status": { $in: ["in_progress", "paused"] } }
+          : { userId: req.user.id, "run.sessionId": sessionId, "run.status": "in_progress" },
+        { $set: { "run.sessionSeenAt": release ? null : new Date() } }
+      );
+    }
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ message: err.message });
