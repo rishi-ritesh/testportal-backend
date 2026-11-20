@@ -1374,6 +1374,67 @@ exports.getResult = async (req, res) => {
     });
 
     // =========================
+    // COMPETITION DATA (fetched once, used per question below)
+    // =========================
+    // Used to be 3 queries PER QUESTION (~300 for a 100-question paper).
+    // Now: the topper once, every answered first-attempt answer to this
+    // paper's questions in one grouped query, and the topper's answers in
+    // one query. The numbers computed from them are exactly the same.
+
+    // topper among first attempts (also used in competitionStats)
+    const topperAttempt =
+      await Attempt.findOne({
+
+        _id: { $in: firstAttemptIds }
+      })
+        .sort({
+          finalScore: -1
+        });
+
+    // per question: how many first attempts answered it, how many of those
+    // were correct, and their times
+    const poolRows = await AttemptAnswer.aggregate([
+      {
+        $match: {
+          attemptId: { $in: firstAttemptIds },
+          questionId: { $in: allQuestionIds },
+          answerStatus: "answered"
+        }
+      },
+      {
+        $group: {
+          _id: "$questionId",
+          total: { $sum: 1 },
+          correct: { $sum: { $cond: ["$isCorrect", 1, 0] } },
+          times: { $push: "$timeSpent" }
+        }
+      }
+    ]);
+
+    const poolByQuestion = new Map(
+      poolRows.map((row) => [String(row._id), row])
+    );
+
+    // the topper's time on each question
+    const topperTimeByQuestion = new Map();
+
+    if (topperAttempt) {
+      const topperAnswers = await AttemptAnswer.find({
+        attemptId: topperAttempt._id,
+        questionId: { $in: allQuestionIds }
+      })
+        .select("questionId timeSpent")
+        .lean();
+
+      topperAnswers.forEach((a) => {
+        const key = String(a.questionId);
+        if (!topperTimeByQuestion.has(key)) {
+          topperTimeByQuestion.set(key, a.timeSpent);
+        }
+      });
+    }
+
+    // =========================
     // OVERALL STATS
     // =========================
 
@@ -1686,24 +1747,15 @@ exports.getResult = async (req, res) => {
         // QUESTION COMPETITION STATS
         // =========================
 
-        const questionAttempts =
-          await AttemptAnswer.find({
-
-            questionId: question.questionId,
-
-            // first-attempt pool only
-            attemptId: { $in: firstAttemptIds },
-
-            answerStatus: "answered"
-          });
+        // first-attempt pool only (fetched above)
+        const pool =
+          poolByQuestion.get(String(question.questionId));
 
         const totalQuestionAttempts =
-          questionAttempts.length;
+          pool ? pool.total : 0;
 
         const correctAttempts =
-          questionAttempts.filter(
-            (a) => a.isCorrect
-          ).length;
+          pool ? pool.correct : 0;
 
         const wrongAttempts =
           totalQuestionAttempts -
@@ -1764,8 +1816,8 @@ exports.getResult = async (req, res) => {
         // =========================
 
         const times =
-          questionAttempts
-            .map((a) => a.timeSpent || 0)
+          (pool ? pool.times : [])
+            .map((t) => Number(t) || 0)
             .filter((t) => t > 0)
             .sort((a, b) => a - b);
 
@@ -1809,31 +1861,9 @@ exports.getResult = async (req, res) => {
           }
         }
 
-        // topper time (topper among first attempts)
-        const topperAttempt =
-          await Attempt.findOne({
-
-            _id: { $in: firstAttemptIds }
-          })
-            .sort({
-              finalScore: -1
-            });
-
-        let topperTimeSpent = 0;
-
-        if (topperAttempt) {
-
-          const topperAnswer =
-            await AttemptAnswer.findOne({
-
-              attemptId: topperAttempt._id,
-
-              questionId: question.questionId
-            });
-
-          topperTimeSpent =
-            topperAnswer?.timeSpent || 0;
-        }
+        // topper time (topper among first attempts; fetched above)
+        const topperTimeSpent =
+          topperTimeByQuestion.get(String(question.questionId)) || 0;
 
         // =========================
         // DIFFICULTY
@@ -1975,15 +2005,7 @@ exports.getResult = async (req, res) => {
     // total participants (first attempts only)
     const totalParticipants = firstAttemptCount;
 
-    // topper (among first attempts)
-    const topperAttempt =
-      await Attempt.findOne({
-
-        _id: { $in: firstAttemptIds }
-      })
-        .sort({
-          finalScore: -1
-        });
+    // topper (among first attempts): fetched once, above
 
     // average score + accuracy (first attempts only)
     const aggregateStats =

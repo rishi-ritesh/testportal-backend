@@ -183,4 +183,10 @@ AttemptSchema.index(
     { unique: true }
 );
 
+// The ranking pool of a test: its completed ranked attempts, by score.
+// Used by results (participants, topper, rank) and My Attempts (rank).
+AttemptSchema.index(
+    { testId: 1, attemptType: 1, status: 1, finalScore: -1 }
+);
+
 module.exports = mongoose.model("Attempt", AttemptSchema);
