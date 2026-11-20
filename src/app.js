@@ -2,6 +2,7 @@
 
 const express = require("express");
 const cors = require("cors");
+const compression = require("compression");
 const mongoose = require("mongoose");
 
 const app = express();
@@ -21,6 +22,11 @@ app.use(
     credentials: true,
   })
 );
+// gzip / brotli responses over 1 KB when the browser accepts it (all do):
+// a 100-question result is ~117 KB as JSON, ~16 KB compressed. The JSON
+// itself is unchanged.
+app.use(compression());
+
 // bump limit so bulk question uploads (bilingual + explanations) fit
 app.use(express.json({ limit: "5mb" }));
 
