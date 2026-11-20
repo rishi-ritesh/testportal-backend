@@ -1,11 +1,14 @@
 // Backend/src/controllers/attempt.controller.js
 
+const mongoose = require("mongoose");
+
 const Attempt = require("../models/Attempt");
 const SetPaper = require("../models/SetPaper");
 const AttemptAnswer = require("../models/AttemptAnswer");
 const Question = require("../models/Question");
 const Package = require("../models/Package");
 const { storePaperCopy, paperOf, questionCounts } = require("../utils/paperCopy");
+const { poolAnswerStats } = require("../utils/poolStats");
 
 // =========================
 // LIVE RANK HELPER
@@ -43,6 +46,96 @@ async function computeFirstAttemptRank(testId, finalScore) {
   );
 
   return { rank, percentile, totalParticipants };
+}
+
+// The same rank as computeFirstAttemptRank, from a test's list of ranked
+// completed scores (fetched once for many tests by rankingScoresByTest).
+// "Better" = a numeric score strictly higher, as the $gt count gives.
+function rankFromScores(scores, finalScore) {
+  const totalParticipants = scores.length;
+
+  if (totalParticipants === 0) {
+    return { rank: null, percentile: null, totalParticipants: 0 };
+  }
+
+  const better = scores.filter(
+    (s) => typeof s === "number" && s > finalScore
+  ).length;
+
+  const rank = better + 1;
+
+  const percentile = Number(
+    (
+      ((totalParticipants - rank) / totalParticipants) * 100
+    ).toFixed(2)
+  );
+
+  return { rank, percentile, totalParticipants };
+}
+
+// A plain (lean) answer row with the schema defaults filled in for fields
+// missing from the stored document — exactly what a full Mongoose document
+// would give (a stored null stays null).
+const ANSWER_DEFAULTS = {
+  selectedOption: null,
+  answerStatus: "not_visited",
+  markedForReview: false,
+  marksAwarded: 0,
+  timeSpent: 0
+};
+
+function withAnswerDefaults(answer) {
+  for (const [key, value] of Object.entries(ANSWER_DEFAULTS)) {
+    if (answer[key] === undefined) answer[key] = value;
+  }
+  return answer;
+}
+
+// testId → every ranked completed score on that test, for many tests in one
+// query (read from the ranking index).
+async function rankingScoresByTest(testIds) {
+  const unique = [...new Set(testIds.map(String))];
+  if (!unique.length) return new Map();
+
+  const rows = await Attempt.aggregate([
+    {
+      $match: {
+        testId: { $in: unique.map((id) => new mongoose.Types.ObjectId(id)) },
+        attemptType: "ranked",
+        status: "completed"
+      }
+    },
+    { $project: { _id: 0, testId: 1, finalScore: 1 } },
+    // every attempt counts as a participant, also one without a score
+    { $group: { _id: "$testId", scores: { $push: { $ifNull: ["$finalScore", null] } } } }
+  ]);
+
+  return new Map(rows.map((r) => [String(r._id), r.scores]));
+}
+
+// attemptId → question count of old attempts' embedded copies, counted in
+// the database (the copies themselves are never loaded).
+async function embeddedQuestionCounts(attemptIds) {
+  if (!attemptIds.length) return new Map();
+
+  const rows = await Attempt.aggregate([
+    { $match: { _id: { $in: attemptIds } } },
+    {
+      $project: {
+        n: {
+          $sum: {
+            $map: {
+              input: { $ifNull: ["$testSnapshot.sections", []] },
+              as: "s",
+              in: { $size: { $ifNull: ["$$s.questions", []] } }
+            }
+          }
+        }
+      }
+    }
+  ]);
+
+  return new Map(rows.map((r) => [String(r._id), r.n]));
 }
 
 // =========================
@@ -1309,14 +1402,58 @@ exports.getResult = async (req, res) => {
       });
     }
 
-    // the paper this attempt was given (shared copy, or the old embedded one)
-    const paper = await paperOf(attempt);
+    // Everything below needs only this attempt, so it is fetched in parallel
+    // (one round trip to the database instead of one per query).
+    const rankingPool = {
+      testId: attempt.testId,
+      attemptType: "ranked",
+      status: "completed"
+    };
 
-    // ✅ fetch answers
-    const answers = await AttemptAnswer.find({
-      attemptId,
-      userId: req.user.id
-    });
+    const [
+      paper,
+      answers,
+      firstAttemptIds,
+      topperAttempt,
+      liveRanked,
+      improvementBase
+    ] = await Promise.all([
+
+      // the paper this attempt was given (shared copy, or the old embedded one)
+      paperOf(attempt),
+
+      // ✅ fetch answers (plain objects: only the fields used below)
+      AttemptAnswer.find({
+        attemptId,
+        userId: req.user.id
+      })
+        .select("questionId selectedOption correctAnswer isCorrect marksAwarded timeSpent answerStatus markedForReview")
+        .lean(),
+
+      // RANKING POOL = RANKED ATTEMPTS ONLY (see below)
+      Attempt.find(rankingPool).distinct("_id"),
+
+      // topper among first attempts: highest score; on a tie the earliest
+      // attempt (lowest id), as before. Only the fields used are loaded.
+      Attempt.findOne(rankingPool)
+        .sort({ finalScore: -1, _id: 1 })
+        .select("finalScore accuracy"),
+
+      // live rank (ranked, completed attempts only)
+      attempt.attemptType === "ranked" && attempt.status === "completed"
+        ? computeFirstAttemptRank(attempt.testId, attempt.finalScore)
+        : null,
+
+      // practice → compared against the student's own ranked attempt
+      attempt.attemptType === "practice"
+        ? Attempt.findOne({
+          userId: req.user.id,
+          testId: attempt.testId,
+          attemptType: "ranked",
+          status: "completed"
+        }).select("finalScore accuracy correctCount")
+        : null
+    ]);
 
     // ✅ create answers map
     const answersMap = {};
@@ -1325,7 +1462,7 @@ exports.getResult = async (req, res) => {
 
       answersMap[
         String(answer.questionId)
-      ] = answer;
+      ] = withAnswerDefaults(answer);
     });
 
     // =========================
@@ -1335,12 +1472,7 @@ exports.getResult = async (req, res) => {
     // averages, per-question difficulty) are computed over each user's
     // RANKED (first) completed attempt only. Practice attempts excluded.
 
-    const firstAttemptIds =
-      await Attempt.find({
-        testId: attempt.testId,
-        attemptType: "ranked",
-        status: "completed"
-      }).distinct("_id");
+    // (firstAttemptIds fetched above)
 
     const firstAttemptCount = firstAttemptIds.length;
 
@@ -1360,9 +1492,57 @@ exports.getResult = async (req, res) => {
       }
     }
 
-    const questionDocs = await Question.find({
-      _id: { $in: allQuestionIds }
-    }).select("explanation");
+    // =========================
+    // COMPETITION DATA (fetched once, used per question below)
+    // =========================
+    // Explanations, every answered first-attempt answer to this paper's
+    // questions (one grouped query), the topper's answers, and the pool
+    // averages — in parallel. The numbers computed from them are the same as
+    // the old per-question queries gave.
+
+    const [questionDocs, poolRows, topperAnswers, aggregateStats] =
+      await Promise.all([
+
+        Question.find({
+          _id: { $in: allQuestionIds }
+        })
+          .select("explanation")
+          .lean(),
+
+        // per question: how many first attempts answered it, how many of
+        // those were correct, and their times (see utils/poolStats)
+        poolAnswerStats(firstAttemptIds, allQuestionIds),
+
+        // the topper's time on each question
+        topperAttempt
+          ? AttemptAnswer.find({
+            attemptId: topperAttempt._id,
+            questionId: { $in: allQuestionIds }
+          })
+            .select("questionId timeSpent")
+            .lean()
+          : [],
+
+        // average score + accuracy (first attempts only)
+        Attempt.aggregate([
+          {
+            $match: {
+              _id: { $in: firstAttemptIds }
+            }
+          },
+          {
+            $group: {
+              _id: null,
+              averageScore: {
+                $avg: "$finalScore"
+              },
+              averageAccuracy: {
+                $avg: "$accuracy"
+              }
+            }
+          }
+        ])
+      ]);
 
     const explanationMap = {};
 
@@ -1373,44 +1553,6 @@ exports.getResult = async (req, res) => {
       };
     });
 
-    // =========================
-    // COMPETITION DATA (fetched once, used per question below)
-    // =========================
-    // Used to be 3 queries PER QUESTION (~300 for a 100-question paper).
-    // Now: the topper once, every answered first-attempt answer to this
-    // paper's questions in one grouped query, and the topper's answers in
-    // one query. The numbers computed from them are exactly the same.
-
-    // topper among first attempts (also used in competitionStats)
-    const topperAttempt =
-      await Attempt.findOne({
-
-        _id: { $in: firstAttemptIds }
-      })
-        .sort({
-          finalScore: -1
-        });
-
-    // per question: how many first attempts answered it, how many of those
-    // were correct, and their times
-    const poolRows = await AttemptAnswer.aggregate([
-      {
-        $match: {
-          attemptId: { $in: firstAttemptIds },
-          questionId: { $in: allQuestionIds },
-          answerStatus: "answered"
-        }
-      },
-      {
-        $group: {
-          _id: "$questionId",
-          total: { $sum: 1 },
-          correct: { $sum: { $cond: ["$isCorrect", 1, 0] } },
-          times: { $push: "$timeSpent" }
-        }
-      }
-    ]);
-
     const poolByQuestion = new Map(
       poolRows.map((row) => [String(row._id), row])
     );
@@ -1418,21 +1560,12 @@ exports.getResult = async (req, res) => {
     // the topper's time on each question
     const topperTimeByQuestion = new Map();
 
-    if (topperAttempt) {
-      const topperAnswers = await AttemptAnswer.find({
-        attemptId: topperAttempt._id,
-        questionId: { $in: allQuestionIds }
-      })
-        .select("questionId timeSpent")
-        .lean();
-
-      topperAnswers.forEach((a) => {
-        const key = String(a.questionId);
-        if (!topperTimeByQuestion.has(key)) {
-          topperTimeByQuestion.set(key, a.timeSpent);
-        }
-      });
-    }
+    topperAnswers.forEach((a) => {
+      const key = String(a.questionId);
+      if (!topperTimeByQuestion.has(key)) {
+        topperTimeByQuestion.set(key, a.timeSpent);
+      }
+    });
 
     // =========================
     // OVERALL STATS
@@ -2005,33 +2138,7 @@ exports.getResult = async (req, res) => {
     // total participants (first attempts only)
     const totalParticipants = firstAttemptCount;
 
-    // topper (among first attempts): fetched once, above
-
-    // average score + accuracy (first attempts only)
-    const aggregateStats =
-      await Attempt.aggregate([
-
-        {
-          $match: {
-            _id: { $in: firstAttemptIds }
-          }
-        },
-
-        {
-          $group: {
-
-            _id: null,
-
-            averageScore: {
-              $avg: "$finalScore"
-            },
-
-            averageAccuracy: {
-              $avg: "$accuracy"
-            }
-          }
-        }
-      ]);
+    // topper and averages (among first attempts): fetched above
 
     const averageScore =
       aggregateStats[0]?.averageScore || 0;
@@ -2046,16 +2153,9 @@ exports.getResult = async (req, res) => {
     let liveRank = null;
     let livePercentile = null;
 
-    if (
-      attempt.attemptType === "ranked" &&
-      attempt.status === "completed"
-    ) {
-      const ranked = await computeFirstAttemptRank(
-        attempt.testId,
-        attempt.finalScore
-      );
-      liveRank = ranked.rank;
-      livePercentile = ranked.percentile;
+    if (liveRanked) {
+      liveRank = liveRanked.rank;
+      livePercentile = liveRanked.percentile;
     }
 
     const competitionStats = {
@@ -2093,12 +2193,8 @@ exports.getResult = async (req, res) => {
 
     if (attempt.attemptType === "practice") {
 
-      const rankedAttempt = await Attempt.findOne({
-        userId: req.user.id,
-        testId: attempt.testId,
-        attemptType: "ranked",
-        status: "completed"
-      });
+      // fetched above
+      const rankedAttempt = improvementBase;
 
       if (rankedAttempt) {
         improvement = {
@@ -2229,40 +2325,71 @@ exports.getNextAttemptInfo = async (req, res) => {
 exports.getMyAttempts = async (req, res) => {
   try {
 
+    // only the fields the list shows — never an old attempt's embedded
+    // copy of the paper (~70–150 KB each)
     const attempts = await Attempt.find({
       userId: req.user.id
     })
-      .populate("testId", "title")
+      .select("attemptType testId status paperCopyId finalScore accuracy startedAt updatedAt")
       .sort({ updatedAt: -1 });
 
-    // question counts for attempts that use a shared paper copy (one query)
-    const sharedCounts = await questionCounts(attempts.map((a) => a.paperCopyId));
+    // Everything else in ONE parallel round (each a single query, however
+    // many attempts): test titles, question counts without loading any paper
+    // (shared copies / old attempts' embedded copies counted in the
+    // database), every ranked score of these tests, and their series.
+    const allTestIds = [
+      ...new Set(attempts.map((a) => a.testId).filter(Boolean).map(String))
+    ];
+
+    const oldIds = attempts.filter((a) => !a.paperCopyId).map((a) => a._id);
+
+    const rankedTestIds = attempts
+      .filter((a) => a.attemptType === "ranked" && a.status === "completed" && a.testId)
+      .map((a) => a.testId);
+
+    const [tests, sharedCounts, embeddedCounts, rankedScores, packages] = await Promise.all([
+      allTestIds.length
+        ? SetPaper.find({ _id: { $in: allTestIds } }).select("title")
+        : [],
+      questionCounts(attempts.map((a) => a.paperCopyId)),
+      embeddedQuestionCounts(oldIds),
+      rankingScoresByTest(rankedTestIds),
+      allTestIds.length
+        ? Package.find({
+          setPapers: { $in: allTestIds },
+          isActive: true
+        }).select("name setPapers")
+        : []
+    ]);
+
+    // the test of an attempt (null if the test no longer exists)
+    const testById = new Map(tests.map((t) => [String(t._id), t]));
+    const testOf = (a) => (a.testId ? testById.get(String(a.testId)) || null : null);
 
     const data = await Promise.all(
       attempts.map(async (a) => {
 
-        // total questions: shared copy → counted above; old attempts → their
-        // own embedded copy
+        // total questions: shared copy or the old embedded copy (counted above)
         const totalQuestions = a.paperCopyId
           ? sharedCounts.get(String(a.paperCopyId)) || 0
-          : (a.testSnapshot?.sections || []).reduce(
-            (sum, s) => sum + (s.questions?.length || 0),
-            0
-          );
+          : embeddedCounts.get(String(a._id)) || 0;
 
         // live rank — ranked completed attempts only; practice unranked
         let rank = null;
         let percentile = null;
 
+        const test = testOf(a);
+
         if (
           a.attemptType === "ranked" &&
           a.status === "completed" &&
-          a.testId?._id
+          test
         ) {
-          const ranked = await computeFirstAttemptRank(
-            a.testId._id,
-            a.finalScore
-          );
+          // from the scores fetched above (one query for all tests); the
+          // single-test count is only used for an attempt without a score
+          const ranked = typeof a.finalScore === "number"
+            ? rankFromScores(rankedScores.get(String(test._id)) || [], a.finalScore)
+            : await computeFirstAttemptRank(test._id, a.finalScore);
           rank = ranked.rank;
           percentile = ranked.percentile;
         }
@@ -2272,9 +2399,9 @@ exports.getMyAttempts = async (req, res) => {
 
           attemptType: a.attemptType,
 
-          testId: a.testId?._id || null,
+          testId: test?._id || null,
 
-          testTitle: a.testId?.title || "Untitled Test",
+          testTitle: test?.title || "Untitled Test",
 
           status: a.status,
 
@@ -2299,16 +2426,12 @@ exports.getMyAttempts = async (req, res) => {
     // Attribute each attempt to the series (package) that contains its test, so
     // a student can tell which series a mock came from. A test may be in more
     // than one package.
+    // (packages fetched above)
     const testIds = [
       ...new Set(data.map((d) => d.testId).filter(Boolean).map(String))
     ];
 
     if (testIds.length) {
-      const packages = await Package.find({
-        setPapers: { $in: testIds },
-        isActive: true
-      }).select("name setPapers");
-
       const seriesByTest = new Map();
       packages.forEach((pkg) => {
         (pkg.setPapers || []).forEach((sid) => {

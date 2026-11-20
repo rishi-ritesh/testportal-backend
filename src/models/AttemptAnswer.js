@@ -144,6 +144,12 @@ AttemptAnswerSchema.index(
     { unique: true }
 );
 
+// The result page's per-question statistics of the ranking pool are read
+// from this index alone (no answer documents are loaded): see utils/poolStats.
+AttemptAnswerSchema.index(
+    { attemptId: 1, questionId: 1, answerStatus: 1, isCorrect: 1, timeSpent: 1 }
+);
+
 module.exports = mongoose.model(
     "AttemptAnswer",
     AttemptAnswerSchema
