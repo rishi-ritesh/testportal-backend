@@ -111,6 +111,15 @@ async function buildSetView(set) {
 // Find the student's set with a run that is still going (in progress/paused).
 // ----- one open test screen per run (same rules as ranked/practice) -----
 const SESSION_LIVE_MS = 30 * 1000;
+
+// A heartbeat / release carries `beat`: the time it was SENT, by the
+// screen's own clock (ms). When a screen releases the test, its release time
+// is stored; a heartbeat from that screen with an earlier time was already on
+// its way before the release and must not mark the screen live again. A
+// heartbeat sent after it (page restored from the back/forward cache) still
+// counts, as before. A screen registering clears it.
+const beatOf = (beat) => (Number.isSafeInteger(beat) && beat > 0 ? beat : null);
+
 const OTHER_SESSION = {
   code: "OTHER_SESSION",
   message: "This test was opened in another tab or device."
@@ -355,7 +364,7 @@ exports.registerRunSession = async (req, res) => {
 
     await CustomSet.updateOne(
       { _id: set._id, "run.status": { $in: ["in_progress", "paused"] } },
-      { $set: { "run.sessionId": sessionId, "run.sessionSeenAt": new Date() } }
+      { $set: { "run.sessionId": sessionId, "run.sessionSeenAt": new Date(), "run.sessionReleaseBeat": null } }
     );
 
     const maxSeq = run.answers.reduce((m, a) => Math.max(m, a.clientSeq || 0), 0);
@@ -523,6 +532,7 @@ exports.syncRunTimer = async (req, res) => {
   try {
     const $min = remainingUpdate(req.body?.remainingSeconds);
     const { sessionId, release } = req.body || {};
+    const beat = beatOf(req.body?.beat);
     // a screen with a sessionId may send just a heartbeat / release
     if (!$min && !sessionId) return res.status(400).json({ message: "remainingSeconds is required" });
     if (await runSessionConflict(req.user.id, sessionId)) {
@@ -539,13 +549,29 @@ exports.syncRunTimer = async (req, res) => {
     // heartbeat keeps this screen "live"; a closing tab / Save & Exit
     // (release) frees it. A heartbeat only counts while the run is not
     // paused, so one still on its way when the student exited can't undo
-    // the release (Save & Exit pauses first).
+    // the release (Save & Exit pauses first), and one sent before this
+    // screen's release never counts (closing the tab right after Resume).
     if (sessionId) {
       await CustomSet.updateOne(
         release
           ? { userId: req.user.id, "run.sessionId": sessionId, "run.status": { $in: ["in_progress", "paused"] } }
-          : { userId: req.user.id, "run.sessionId": sessionId, "run.status": "in_progress" },
-        { $set: { "run.sessionSeenAt": release ? null : new Date() } }
+          : {
+            userId: req.user.id,
+            "run.sessionId": sessionId,
+            "run.status": "in_progress",
+            ...(beat && {
+              $or: [
+                { "run.sessionReleaseBeat": null },
+                { "run.sessionReleaseBeat": { $lt: beat } }
+              ]
+            })
+          },
+        release
+          ? {
+            $set: { "run.sessionSeenAt": null },
+            ...(beat && { $max: { "run.sessionReleaseBeat": beat } })
+          }
+          : { $set: { "run.sessionSeenAt": new Date() } }
       );
     }
     res.json({ ok: true });

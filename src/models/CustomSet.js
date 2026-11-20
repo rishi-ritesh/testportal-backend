@@ -83,6 +83,8 @@ const runSchema = new mongoose.Schema(
     // the test screen that currently owns this run (see attempt sessions)
     sessionId: { type: String, default: null },
     sessionSeenAt: { type: Date, default: null },
+    // send time of that screen's last release (see attempt sessions)
+    sessionReleaseBeat: { type: Number, default: null },
     questions: [runQuestionSchema],
     answers: [runAnswerSchema]
   },

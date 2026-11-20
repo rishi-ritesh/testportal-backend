@@ -62,6 +62,13 @@ const AttemptSchema = new mongoose.Schema({
         default: null
     },
 
+    // send time (screen's clock, ms) of that screen's last release; its
+    // heartbeats sent earlier are ignored (see attempt.controller syncTimer)
+    sessionReleaseBeat: {
+        type: Number,
+        default: null
+    },
+
     currentSectionIndex: {
         type: Number,
         default: 0

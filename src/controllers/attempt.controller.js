@@ -544,6 +544,15 @@ exports.getAttemptState = async (req, res) => {
 // Requests without a sessionId (older app versions) are still accepted.
 const SESSION_LIVE_MS = 30 * 1000;
 
+// A heartbeat / release carries `beat`: the time it was SENT, by the
+// screen's own clock (ms). When a screen releases the test, its release time
+// is stored; a heartbeat from that screen with an earlier time was already on
+// its way before the release and must not mark the screen live again. A
+// heartbeat sent after it (page restored from the back/forward cache) still
+// counts, as before. A screen registering clears it.
+const beatOf = (beat) => (Number.isSafeInteger(beat) && beat > 0 ? beat : null);
+
+
 const OTHER_SESSION = {
   code: "OTHER_SESSION",
   message: "This test was opened in another tab or device."
@@ -584,7 +593,7 @@ exports.registerSession = async (req, res) => {
 
     await Attempt.updateOne(
       { _id: attempt._id },
-      { $set: { sessionId, sessionSeenAt: new Date() } }
+      { $set: { sessionId, sessionSeenAt: new Date(), sessionReleaseBeat: null } }
     );
 
     // highest save sequence already stored, so this screen's new saves are
@@ -1254,6 +1263,7 @@ function clampRemaining(stored, reported) {
 exports.syncTimer = async (req, res) => {
   try {
     const { attemptId, remainingSeconds, sessionId, release } = req.body;
+    const beat = beatOf(req.body.beat);
     const hasTime = typeof remainingSeconds === "number";
     // a screen with a sessionId may send just a heartbeat / release (untimed section)
     if (!attemptId || (!hasTime && !sessionId)) {
@@ -1283,16 +1293,30 @@ exports.syncTimer = async (req, res) => {
     // (release) frees it. Separate single updates, so a heartbeat that was
     // already on its way when the student exited can never undo the release:
     // a heartbeat only counts while the test is not paused (Save & Exit
-    // pauses first).
+    // pauses first), and never if it was sent before this screen's release
+    // (closing the tab right after Resume).
     if (sessionId && attempt.sessionId === sessionId) {
       if (release) {
         await Attempt.updateOne(
           { _id: attempt._id, sessionId },
-          { $set: { sessionSeenAt: null } }
+          {
+            $set: { sessionSeenAt: null },
+            ...(beat && { $max: { sessionReleaseBeat: beat } })
+          }
         );
       } else {
         await Attempt.updateOne(
-          { _id: attempt._id, sessionId, status: { $ne: "paused" } },
+          {
+            _id: attempt._id,
+            sessionId,
+            status: { $ne: "paused" },
+            ...(beat && {
+              $or: [
+                { sessionReleaseBeat: null },
+                { sessionReleaseBeat: { $lt: beat } }
+              ]
+            })
+          },
           { $set: { sessionSeenAt: new Date() } }
         );
       }
