@@ -6,6 +6,10 @@ const upload = require("../controllers/questionUpload.controller");
 const pkg = require("../controllers/package.controller");
 const students = require("../controllers/studentAdmin.controller");
 const media = require("../controllers/upload.controller");
+const stats = require("../controllers/stats.controller");
+
+/* DASHBOARD (read-only counts) */
+router.get("/stats", auth, role("admin"), stats.getStats);
 
 /* SUBJECTS */
 router.post("/subject", auth, role("admin"), admin.createSubject);
